@@ -131,7 +131,7 @@ runtime 內附 Noto Sans CJK，一個字型集就涵蓋繁體中文、港字（H
 - 點選和高亮用的文字外框是估算的，中日文字會估得偏寬。
 - 大型 Gerber 第一次開啟時要先轉檔，20 萬個圖元的電路板約需 20 秒；之後會用快取，幾秒內就能開啟。
 - 非常大的圖，第一次 `click` 或 `inspect` 要等 ezdxf 讀完檔案（20 萬個圖元約 15 秒）。算圖不受影響。
-- 已在 Windows x64 和 Linux x64 測試。macOS 和 ARM 版本已固定好下載來源，但還沒測試。
+- 已在 Windows x64 和 Linux x64 測試，macOS（Apple Silicon）也通過 CI 的測試。Windows ARM、Linux ARM 和 Intel Mac 版本已固定好下載來源，但還沒測試。
 
 ## 開發
 

@@ -163,7 +163,8 @@ render: missing characters come from the bundled font.
   200,000-entity board); later opens use the cache and take a few seconds.
 - On very large drawings the first `click`/`inspect` waits for ezdxf to finish reading the file
   (about 15 s for 200,000 entities). Rendering does not wait.
-- Tested on Windows x64 and Linux x64. macOS and ARM builds are pinned but untested.
+- Tested on Windows x64 and Linux x64; the test suite also passes on macOS (Apple Silicon) in CI.
+  Windows ARM, Linux ARM and Intel Mac builds are pinned but untested.
 
 ## Development
 
