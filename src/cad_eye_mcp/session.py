@@ -34,7 +34,11 @@ FORBIDDEN_COMMANDS = ("save", "qsave", "saveas", "wblock", "export", "exportpdf"
                       "share", "close", "closeall", "open", "new", "xattach", "attach", "import",
                       "xopen", "bsave", "bsaveas", "appload", "lisp", "script", "drawingrecovery",
                       "recover", "compareexport", "tableexport", "plottermanager", "-plottermanager",
-                      "options", "stylesmanager")
+                      "options", "stylesmanager", "layout.saveas", "pdfbook", "refclose", "aliasedit",
+                      "reinit")
+# commands that write a file only when given one of these parameters (with any value, or this value)
+WRITES_WITH = {"layout": ("option", "saveas"), "dataextraction": ("file", None), "eattext": ("file", None)}
+AUTOSAVE_VARS = ("SAVETIME", "SAVEFILEPATH")  # switched off on open, and kept off
 
 
 class ViewerError(RuntimeError):
@@ -154,6 +158,7 @@ class Session:
         self.cjk_auto = "CAD_EYE_CJK" not in os.environ  # an explicit setting is never overridden
         self._lock = threading.RLock()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ezdxf")
+        self._aliases: dict[str, str] | None = None  # command name or alias -> command id
 
     # -- helpers ---------------------------------------------------------------------
     @property
@@ -224,7 +229,7 @@ class Session:
                     # each engine would number the entities its own way: ezdxf reads CADCraft's copy
                     work = cache / f"dxf-{key}.dxf"
 
-            opened = self.cc.call("open", {"path": str(open_path)}).json() or {}
+            opened = self._engine_open(open_path)
             notes += opened.get("warnings", []) if isinstance(opened, dict) else []
             # objects the engine could not read from the file at all (none of them is shown)
             skipped = (self.cc.call("inspect_drawing", {}).json().get("skipped") or {}).get("count", 0)
@@ -247,7 +252,7 @@ class Session:
                     psum = json.loads(pmeta.read_text(encoding="utf-8"))
                 if psum["drawn"]:
                     work = open_path = pwork
-                    self.cc.call("open", {"path": str(open_path)})
+                    self._engine_open(open_path)
                     kinds = ", ".join(f"{t} x{n}" for t, n in psum["drawn"].items())
                     how = ", ".join(sorted(psum["how"]))
                     notes.append(f"Drawn by stand-ins ({how}): {kinds}. CADCraft cannot draw these types; "
@@ -317,6 +322,13 @@ class Session:
                     notes.append(f"CJK glyphs set to {region.upper()} from the drawing's text")
             return d
 
+    def _engine_open(self, path: Path) -> dict:
+        """Open a file in the engine with autosave off: changes made through cad_command must
+        never reach a file, not even an autosave copy."""
+        opened = self.cc.call("open", {"path": str(path)}).json() or {}
+        self.cc.execute("setvar", {"name": "SAVETIME", "value": 0})
+        return opened if isinstance(opened, dict) else {}
+
     # -- CJK glyph region --------------------------------------------------------------
     @property
     def cjk(self) -> str:
@@ -339,7 +351,7 @@ class Session:
         d = self.d
         if d is None:
             return
-        self.cc.call("open", {"path": str(d.engine_path)})
+        self._engine_open(d.engine_path)
         self._relink_xrefs(d.source)
         if d.layout != "Model":
             self.cc.execute("layout.set", {"name": d.layout})
@@ -1276,10 +1288,29 @@ class Session:
         return out, regions
 
     # -- raw command passthrough -----------------------------------------------------
+    def _command_id(self, command: str) -> str:
+        """The command id a name or alias stands for. CADCraft's execute takes ids only today;
+        resolving aliases keeps the blocklist whole should that change."""
+        if self._aliases is None:
+            self._aliases = {}
+            for c in self.cc.call("list_commands", {}).json() or []:
+                cid = c["id"].lower()
+                for name in [c["id"], *c.get("aliases", [])]:
+                    self._aliases.setdefault(name.lower(), cid)
+        name = command.strip().lower()
+        return self._aliases.get(name) or self._aliases.get(name.lstrip("-_.")) or name
+
     def command(self, command: str, params: dict | None) -> Any:
-        if command.lower().lstrip("-_.") in FORBIDDEN_COMMANDS or command.lower() in FORBIDDEN_COMMANDS:
+        params = params or {}
+        cid = self._command_id(command)
+        if {cid, cid.lstrip("-_."), command.lower().lstrip("-_.")} & set(FORBIDDEN_COMMANDS):
             raise ViewerError(f"'{command}' is not allowed: the viewer never writes or opens files.")
-        if command.lower() in ("layout.set", "ctab"):
+        key, value = WRITES_WITH.get(cid.lstrip("-_."), (None, None))
+        if key and params.get(key) and (value is None or str(params[key]).lower() == value):
+            raise ViewerError(f"'{command}' with {key} would write a file, which the viewer never does.")
+        if cid == "setvar" and str(params.get("name", "")).upper() in AUTOSAVE_VARS:
+            raise ViewerError("Autosave stays off: the viewer never writes files.")
+        if cid in ("layout.set", "ctab"):
             raise ViewerError("Switch layouts with the layout tool, so the view follows.")
         with self._lock:
             result = self.cc.execute(command, params or {})

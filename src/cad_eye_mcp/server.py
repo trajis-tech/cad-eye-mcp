@@ -524,5 +524,5 @@ def cad_command(
 ) -> str:
     """Run a CADCraft command directly (its catalog has 400+ AutoCAD-style commands). Use for
     inquiries the other tools do not cover. Changes stay in the viewer session and are never
-    saved; saving, exporting and opening files is blocked."""
+    saved; any command that writes or opens a file is refused."""
     return json.dumps(session.command(command, params), ensure_ascii=False, indent=1, default=str)

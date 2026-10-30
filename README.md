@@ -9,6 +9,21 @@ Works with **DXF**, **DWG**, and PCB **Gerber / Excellon** files (single files, 
 Chinese (Taiwan, Hong Kong/Macau, Mainland), Japanese and English text all render with the right
 glyphs.
 
+cad-eye only reads drawings. Creating, editing and modifying them, with version history, will be
+the job of **cad-hand**, a separate MCP server made to work alongside it. cad-hand's first release
+will be 2.0.0, together with cad-eye 2.0.0, which adds the interface between the two; from then
+on both share version numbers. Keeping them apart is deliberate:
+
+- **Safe to give to any AI.** cad-eye writes nothing but its own cache of converted files. Saving,
+  exporting, plotting, autosave and every other command that writes is refused or switched off.
+  Reviewing a drawing never puts it at risk, so a client can let cad-eye work without confirming
+  each step. Write access comes only with cad-hand, where you choose to add it.
+- **Edits checked by a tool that did not make them.** Once cad-hand has changed a drawing, cad-eye
+  compares the result with the original (`compare`) and reports anything it cannot show
+  (`check`).
+- **Fewer tools when only reading.** Reviewing, measuring and comparing need no editing tools, so
+  a model that only has to read a drawing is not handed any.
+
 [繁體中文說明](README.zh-TW.md)
 
 ![The AI's screen: rulers in drawing units, a grid, the clicked Japanese text and an MTEXT outlined in magenta, a minimap and a status bar](docs/screenshot.png)
@@ -47,7 +62,7 @@ units), so the AI can point at what it sees.
 | `check` | Completeness and integrity report: what of the file is not on screen and why (entities that cannot be drawn, entities the engine could not read, missing xrefs and image files, hidden layers, other layouts, audit problems, unconverted Gerber data), with the problems marked on the drawing |
 | `mark` | Put labelled markers on the drawing to point out findings |
 | `screen_settings` | Screen size, grid, minimap, CJK glyph region |
-| `cad_command` | Run any of CADCraft's 400+ AutoCAD-style commands (saving/exporting is blocked) |
+| `cad_command` | Run any of CADCraft's 400+ AutoCAD-style commands (commands that write files are refused) |
 
 Files are never modified.
 
@@ -202,7 +217,7 @@ render: missing characters come from the bundled font.
 
 ## Limitations
 
-- Read-only viewer for now: nothing is saved. Editing is planned.
+- Read-only by design: nothing is saved. Editing comes with cad-hand (see the top of this page).
 - Viewports on a sheet are clickable when they show a plan view (looking straight down); 3D views
   are drawn but not clickable. Box selection and `find` work on the sheet's own entities; switch
   to `Model` for the part. If model space has nothing to draw, the first layout opens instead.

@@ -10,7 +10,7 @@ import ezdxf
 from PIL import Image
 
 from cad_eye_mcp import paths
-from cad_eye_mcp.session import Session, ViewerError
+from cad_eye_mcp.session import FORBIDDEN_COMMANDS, Session, ViewerError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cjk_mixed.dxf"
 SHEET = Path(__file__).parent / "fixtures" / "sheet_layout.dxf"
@@ -70,8 +70,18 @@ class ViewerTest(unittest.TestCase):
         self.assertEqual(res["count"], 1)
 
     def test_writes_are_blocked(self):
-        with self.assertRaises(Exception):
-            self.s.command("save", {"path": "x.dxf"})
+        writers = [("save", {"path": "x.dxf"}), ("layout.saveas", {"path": "x.dwt"}), ("pdfbook", {}),
+                   ("layout", {"option": "SaveAs", "path": "x.dwt"}), ("-layout", {"option": "saveas"}),
+                   ("dataextraction", {"file": "x.csv"}), ("eattext", {"file": "x.txt"}), ("refclose", {}),
+                   ("setvar", {"name": "savetime", "value": 10}), ("setvar", {"name": "SAVEFILEPATH", "value": "."})]
+        self.assertEqual(self.s.cc.execute("getvar", {"name": "SAVETIME"})["value"], 0)  # no autosave copies
+        catalog = self.s.cc.call("list_commands", {}).json()
+        writers += [(a, {}) for c in catalog if c["id"] in FORBIDDEN_COMMANDS for a in c.get("aliases", [])]
+        for command, params in writers:
+            with self.assertRaises(ViewerError, msg=command):
+                self.s.command(command, params)
+        # the same commands without a file to write stay available
+        self.assertIn("rows", self.s.command("dataextraction", {}))
 
     def test_zoom_window_then_back(self):
         before = self.s.drawing.view
