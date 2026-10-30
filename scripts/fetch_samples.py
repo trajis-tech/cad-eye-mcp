@@ -41,6 +41,8 @@ for name in ["mixtape.gbl", "mixtape.gbo", "mixtape.gbp", "mixtape.gbs", "mixtap
 
 SAMPLES += [
     ("gerber/mrfixit-v1.1.zip", f"{MRFIXIT}/mrfixit-v1.1.zip", "BSD-2-Clause, TomKeddie/prj-pcb-experiments"),
+    # the revision before v1.1 ("v1.1 edge cuts changes as v1.0 failed audit"): a real pair to compare
+    ("gerber/mrfixit-v1.0.zip", f"{MRFIXIT}/mrfixit-v1.0.zip", "BSD-2-Clause, TomKeddie/prj-pcb-experiments"),
     ("pcb-dxf/mrfixit.kicad_pcb.dxf", f"{MRFIXIT}/mrfixit.kicad_pcb.dxf", "BSD-2-Clause, TomKeddie/prj-pcb-experiments"),
     ("pcb-dxf/kicad_oracle_all_layers.dxf", f"{ZIRO}/dxfsingle/gerber_oracle.dxf", "GPL-3.0, ZiroEDA/ziro-designer QA data"),
     ("pcb-dxf/kicad_oracle-F_Cu.dxf", f"{ZIRO}/dxf/gerber_oracle-F_Cu.dxf", "GPL-3.0, ZiroEDA/ziro-designer QA data"),

@@ -18,6 +18,9 @@ RULER_TEXT = (170, 178, 189)
 GRID = (255, 255, 255, 30)
 HILITE = (255, 61, 245)
 MARKER = (255, 166, 0)
+# drawing comparison: what was added, removed, changed (new version) and the old version of it
+DIFF = {"added": (64, 222, 100), "removed": (255, 74, 74), "changed": (70, 172, 255), "was": (255, 74, 74)}
+REGION = (236, 238, 242)
 MINIMAP_W = 200
 
 _fonts: dict[int, ImageFont.ImageFont] = {}
@@ -56,6 +59,9 @@ class Overlay:
     markers: list[tuple[Point, str]] = field(default_factory=list)
     boxes: list[BBox] = field(default_factory=list)
     lines: list[list[Point]] = field(default_factory=list)              # e.g. a measurement path
+    diff: list[tuple[str, list[np.ndarray]]] = field(default_factory=list)  # (DIFF kind, polylines)
+    regions: list[tuple[BBox, str]] = field(default_factory=list)        # numbered change regions
+    dim: bool = False                                                    # fade the drawing under `diff`
 
 
 def _ticks(lo: float, hi: float, step: float) -> list[float]:
@@ -75,6 +81,8 @@ def compose(view: View, render_png: bytes, overlay: Overlay, status: list[str],
     area = Image.open(io.BytesIO(render_png)).convert("RGBA")
     if area.size != (aw, ah):
         area = area.resize((aw, ah))
+    if overlay.dim:
+        area = Image.blend(area, Image.new("RGBA", area.size, PANEL + (255,)), 0.6)
     top = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
     d = ImageDraw.Draw(top)
     if grid:
@@ -89,6 +97,27 @@ def compose(view: View, render_png: bytes, overlay: Overlay, status: list[str],
         ax = (pts[:, 0] - x0) / view.scale
         ay = (y1 - pts[:, 1]) / view.scale
         return list(zip(ax.tolist(), ay.tolist()))
+
+    for ((bx0, by0), (bx1, by1)), label in overlay.regions:
+        (ax0, ay0), (ax1, ay1) = to_area(np.asarray([[bx0, by1], [bx1, by0]]))
+        ax0, ay0, ax1, ay1 = ax0 - 8, ay0 - 8, ax1 + 8, ay1 + 8
+        if ax1 < 0 or ay1 < 0 or ax0 > aw or ay0 > ah:
+            continue  # off screen
+        d.rectangle([ax0, ay0, ax1, ay1], outline=REGION + (150,), width=1)
+        d.text((min(max(ax0, 2), aw - 40), min(max(ay0 - 18, 2), ah - 18)), f"#{label}", font=font(14),
+               fill=REGION + (255,), stroke_width=3, stroke_fill=PANEL + (255,))
+
+    for kind, shapes in overlay.diff:
+        color = DIFF.get(kind, HILITE)
+        pxs = [to_area(s) for s in shapes if len(s)]
+        for ps in pxs:
+            if len(ps) >= 2:
+                d.line(ps, fill=color + (235,), width=1 if kind == "was" else 2, joint="curve")
+        if pxs and kind != "was":
+            allp = np.asarray([p for ps in pxs for p in ps])
+            if float(np.ptp(allp, axis=0).max()) < 10:  # too small to see: ring it
+                cx, cy = allp.mean(axis=0)
+                d.ellipse([cx - 9, cy - 9, cx + 9, cy + 9], outline=color + (255,), width=2)
 
     for shapes in overlay.highlights:
         pxs = [to_area(s) for s in shapes if len(s)]

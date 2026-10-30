@@ -1,7 +1,7 @@
 [project]
 name = "cad-eye-mcp"
 version = "1.0.0"
-description = "MCP server that lets an AI operate a CAD viewer: zoom, pan, click, layers and measure on DXF, DWG and Gerber files"
+description = "MCP server that lets an AI operate a CAD viewer: zoom, pan, click, layers, measure and compare revisions of DXF, DWG and Gerber files"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

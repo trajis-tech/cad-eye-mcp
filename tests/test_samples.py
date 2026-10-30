@@ -76,6 +76,12 @@ class SampleTest(unittest.TestCase):
         self.assertEqual(len(hits[0]["rows"]), 7)
         table = self.picked((348.39, 98.69))  # inside a cell of the door schedule
         self.assertEqual((table["type"], table["title"], table["rows"]), ("ACAD_TABLE", "DOOR SCHEDULE", 9))
+        # the first floor plan is a 20:1 viewport: a click there picks the wall in model space
+        wall = self.s.pick((150.447368, 356.736842))[0][0]
+        self.assertEqual(self.s.describe([wall])[0]["layer"], "Walls")
+        self.assertEqual(self.s.through_viewport(wall, (150.447368, 356.736842))["viewport"], "681C")
+        vp, model = self.s.to_model([(100, 300), (200, 300)])
+        self.assertAlmostEqual(model[1][0] - model[0][0], 5.0, places=6)  # 100 mm on paper = 5 m
 
     def test_r12_dxf_without_handles(self):
         d = self.open("mech/nist_chopper_bowl.dxf")
@@ -91,6 +97,9 @@ class SampleTest(unittest.TestCase):
         self.assertIn("ACAD_PROXY_ENTITY", d.unsupported)
         if (SAMPLES / "mech/SWITCH.dwg").exists():
             self.assertFalse([n for n in d.notes if "External references not found" in n])
+        # the same file compared with itself: stand-ins and xrefs must not show up as changes
+        c = self.s.compare(str(SAMPLES / "mech/DRYER_ASSEMBLY.dwg"))
+        self.assertEqual((c.changes, c.unchanged > 2000), ([], True))
 
     # -- entity types CADCraft does not draw -----------------------------------------------------
     def test_uncommon_types(self):
@@ -123,6 +132,22 @@ class SampleTest(unittest.TestCase):
     def test_large_board_over_50k_entities(self):
         d = self.open("gerber/mrfixit-v1.1.zip")
         self.assertGreater(sum(d.counts.values()), 50_000)
+
+    def test_board_revisions(self):
+        # "v1.1 edge cuts changes as v1.0 failed audit": the board outline is what changed
+        if not (SAMPLES / "gerber/mrfixit-v1.0.zip").exists():
+            self.skipTest("gerber/mrfixit-v1.0.zip not fetched (run scripts/fetch_samples.py)")
+        self.open("gerber/mrfixit-v1.1.zip")
+        t = time.perf_counter()
+        self.s.compare(str(SAMPLES / "gerber/mrfixit-v1.0.zip"))
+        dt = time.perf_counter() - t
+        TIMINGS["compare gerber/mrfixit-v1.0.zip"] = {"compare_s": round(dt, 2), "slow": dt > SLOW}
+        self.assertLess(dt, LIMIT, f"comparing took {dt:.1f}s")
+        summary = self.s.comparison_summary()
+        edge = summary["by_layer"]["Edge.Cuts"]
+        self.assertGreater(edge.get("removed", 0), 2000)
+        self.assertEqual(set(summary["by_layer"]), {"Edge.Cuts", "B.SilkS", "F.Mask"})
+        self.assertGreater(summary["unchanged"], 200_000)
 
 
 if __name__ == "__main__":

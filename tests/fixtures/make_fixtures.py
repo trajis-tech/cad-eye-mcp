@@ -74,8 +74,8 @@ def cjk_mixed() -> Path:
 
 
 def sheet_layout() -> Path:
-    """A part in model space placed on an A3 sheet through a 1:1 viewport, with a border, a
-    title text and notes in paper space."""
+    """A part in model space placed on an A3 sheet through a 1:1 viewport and a 1:2 detail
+    viewport, with a border, a title text and notes in paper space."""
     doc = ezdxf.new("R2018", setup=True)
     doc.header["$INSUNITS"] = 4
     msp = doc.modelspace()
@@ -86,6 +86,8 @@ def sheet_layout() -> Path:
     sheet.page_setup(size=(420, 297), margins=(0, 0, 0, 0), units="mm")
     sheet.add_lwpolyline([(10, 10), (410, 10), (410, 287), (10, 287)], close=True)
     sheet.add_viewport(center=(160, 160), size=(200, 120), view_center_point=(60, 30), view_height=120)
+    # a detail view at half scale: one paper mm shows two model mm
+    sheet.add_viewport(center=(300, 220), size=(100, 60), view_center_point=(60, 30), view_height=120)
     sheet.add_text("圖號 M-001 法蘭", height=6).set_placement((300, 30), align=TextEntityAlignment.LEFT)
     sheet.add_mtext("NOTES: ALL HOLES THROUGH.\\PBREAK SHARP EDGES.",
                     dxfattribs={"char_height": 4}).set_location((300, 120))

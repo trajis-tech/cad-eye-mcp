@@ -13,15 +13,17 @@ import math
 import os
 import sys
 import threading
+from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from ezdxf.document import Drawing as DxfDoc
 from PIL import Image
 
-from . import deep, gerber, paths, proxy
+from . import deep, diff, gerber, paths, proxy
 from .cadcraft import CadCraft, CadCraftError
 from .frame import MINIMAP_W, Overlay, compose
 from .frame import _fonts as frame_fonts
@@ -79,6 +81,18 @@ def _encodes(ch: str, codec: str) -> bool:
 
 
 @dataclass
+class Comparison:
+    """The open drawing compared with another version of it (the baseline)."""
+    baseline: Path
+    doc: DxfDoc                    # the baseline as ezdxf reads it
+    tolerance: float
+    changes: list[diff.Change]
+    regions: list[diff.Region]
+    unchanged: int
+    shapes: dict[int, list] = field(default_factory=dict)  # change index -> overlay polylines
+
+
+@dataclass
 class Drawing:
     source: Path
     kind: str                      # dxf | dwg | gerber
@@ -99,7 +113,7 @@ class Drawing:
     dxf: Future | None = None
     gerber_summary: dict | None = None
     thumb: tuple[str, Any, View] | None = None
-    text_index: list[tuple] | None = None
+    text_index: dict[str, list[tuple]] = field(default_factory=dict)  # space -> text boxes
     layout: str = "Model"          # the space on screen: "Model" or a paper-space layout name
     model_units: str = "unitless"
     paper_units: dict[str, str] = field(default_factory=dict)  # layout name -> mm | in
@@ -110,6 +124,8 @@ class Drawing:
     proxy_origin: dict[str, list[str]] | None = None  # drawn entity -> [proxy/solid handle, class]
     unsupported: dict[str, int] = field(default_factory=dict)  # objects in the file not drawn, by type
     stand_ins: dict[str, list[str]] = field(default_factory=dict)  # original handle -> drawn handles
+    comparison: Comparison | None = None
+    through: dict[str, str] = field(default_factory=dict)  # model handle -> viewport it was picked in
 
 
 def _cache_key(path: Path) -> str:
@@ -402,7 +418,8 @@ class Session:
         d.layers = info.get("layers", d.layers)
         d.extents = extents or ((0, 0), (100, 100))
         d.view = fit_view(d.extents, *self.size)
-        d.history, d.selection, d.text_index, d.thumb = [], [], None, None
+        d.history, d.selection, d.thumb = [], [], None
+        d.through = {}
         self.annotate()
 
     @staticmethod
@@ -417,6 +434,9 @@ class Session:
             v = d.view
             png = self.cc.render(v.window, v.width_px, v.height_px)
             overlay = Overlay(markers=list(d.markers), boxes=list(d.boxes), lines=list(d.lines))
+            if d.comparison is not None:
+                overlay.dim = True
+                overlay.diff, overlay.regions = self._diff_overlay()
             if d.selection:
                 doc = self.doc(wait=120)
                 if doc is not None:
@@ -427,6 +447,10 @@ class Session:
                             e = deep.entity_by_handle(doc, part)
                             if e is not None:
                                 shapes += deep.polylines(e)
+                        vp = deep.entity_by_handle(doc, d.through[h]) if h in d.through else None
+                        if vp is not None:  # a model-space entity seen through a viewport
+                            m, box = deep.model_to_paper(vp), deep.viewport_box(vp)
+                            shapes = [part for s in shapes for part in deep.clip(deep.transform(s, m), box)]
                         if shapes:
                             overlay.highlights.append(shapes)
             mm = self._minimap() if self.minimap else None
@@ -461,6 +485,10 @@ class Session:
                  f"{v.scale:.4g} {d.units}/px  |  zoom {zoom:.3g}x")
         sel = f"selected {len(d.selection)}" + (f" ({', '.join(d.selection[:4])}{'…' if len(d.selection) > 4 else ''})" if d.selection else "")
         line2 = f"layers {on}/{len(d.layers)} visible  |  {sel}  |  px coords = this image's pixels"
+        if d.comparison is not None:
+            n = Counter(ch.kind for ch in d.comparison.changes)
+            line2 = (f"compare vs {d.comparison.baseline.name}: +{n['added']} added (green)  "
+                     f"-{n['removed']} removed (red)  ~{n['changed']} changed (blue)  |  {sel}")
         return [line1, line2]
 
     def state_text(self, extra: dict | None = None) -> str:
@@ -477,6 +505,8 @@ class Session:
         }
         if d.layout != "Model":
             state["layout"] = d.layout
+        if d.comparison is not None:
+            state["comparing_with"] = d.comparison.baseline.name
         if extra:
             state.update(extra)
         return json.dumps(state, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -599,27 +629,78 @@ class Session:
                 # really drawn near the point. Entities ezdxf cannot see (inf) stay as fallbacks.
                 if math.isinf(dist) or dist <= tol * 1.5:
                     ranked.append((h, dist))
+            d.through = {h: v for h, v in d.through.items() if h in d.selection}
+            vp = deep.viewport_at(doc, d.layout, p) if doc is not None and d.layout != "Model" else None
+            if vp is not None:
+                ranked += self._pick_through(doc, vp, p, tol)
             # prefer what is actually under the cursor; among equals, the smaller object
             ranked.sort(key=lambda t: (round(t[1] / max(tol, 1e-12), 1), self._size(doc, t[0])))
             self.annotate(markers=[(p, "click")], boxes=[box])
             return ranked
 
-    def _texts_near(self, p: Point, tol: float) -> list[str]:
+    def _pick_through(self, doc, vp, p: Point, tol: float) -> list[tuple[str, float]]:
+        """Model-space entities under paper point `p` inside viewport `vp`, with their distance
+        in paper units. Layers frozen in that viewport are skipped."""
         d = self.drawing
-        if d.text_index is None:
+        scale = vp.get_scale() or 1.0  # paper units per model unit
+        (mx, my), = deep.transform(np.asarray([p]), np.linalg.inv(deep.model_to_paper(vp)))
+        mtol = tol / scale
+        self.cc.execute("layout.set", {"name": "Model"})
+        try:
+            handles = self.candidates(((mx - mtol, my - mtol), (mx + mtol, my + mtol)), limit=300)
+        finally:
+            self.cc.execute("layout.set", {"name": d.layout})
+        handles += [h for h in self._texts_near((mx, my), mtol, "Model") if h not in handles]
+        out = []
+        for h in handles:
+            e = deep.entity_by_handle(doc, h)
+            if e is None or vp.is_frozen(e.dxf.layer):
+                continue
+            dist = deep.distance(e, (mx, my))
+            if dist <= mtol * 1.5:
+                out.append((h, dist * scale))
+                d.through[h] = vp.dxf.handle
+        return out
+
+    def through_viewport(self, handle: str, p: Point) -> dict[str, Any] | None:
+        """For an entity picked through a viewport: which viewport, its scale, the model point."""
+        d = self.drawing
+        vp = deep.entity_by_handle(self.doc(), d.through[handle]) if handle in d.through else None
+        if vp is None:
+            return None
+        (mx, my), = deep.transform(np.asarray([p]), np.linalg.inv(deep.model_to_paper(vp)))
+        return {"viewport": vp.dxf.handle, "paper_units_per_model_unit": round(vp.get_scale(), 6),
+                "model_point": [round(mx, 6), round(my, 6)], "space": "Model"}
+
+    def to_model(self, pts: list[Point]) -> tuple[Any, list[Point]] | None:
+        """Paper points that all lie in one viewport, mapped to model space: (viewport, points)."""
+        d = self.drawing
+        doc = self.doc()
+        if doc is None or d.layout == "Model" or not pts:
+            return None
+        vp = deep.viewport_at(doc, d.layout, pts[0])
+        if vp is None or any(deep.viewport_at(doc, d.layout, q) is not vp for q in pts[1:]):
+            return None
+        model = deep.transform(np.asarray(pts), np.linalg.inv(deep.model_to_paper(vp)))
+        return vp, [(float(x), float(y)) for x, y in model]
+
+    def _texts_near(self, p: Point, tol: float, space: str | None = None) -> list[str]:
+        d = self.drawing
+        space = space or d.layout
+        if space not in d.text_index:
             doc = self.doc()
             rows = []
             if doc is not None:
                 # tables too: a click inside a cell touches none of the table's lines
-                tables = (e for e in deep.space(doc, d.layout) if e.dxftype() == deep.TABLE)
-                for e in [*deep.texts(doc, d.layout), *tables]:
+                tables = (e for e in deep.space(doc, space) if e.dxftype() == deep.TABLE)
+                for e in [*deep.texts(doc, space), *tables]:
                     bb = deep.entity_bbox(e)
                     if bb:
                         rows.append((e.dxf.handle, e.dxf.layer, bb[0][0], bb[0][1], bb[1][0], bb[1][1]))
-            d.text_index = rows
+            d.text_index[space] = rows
         visible = self._visible_layers()
         x, y = p
-        return [h for h, layer, x0, y0, x1, y1 in d.text_index
+        return [h for h, layer, x0, y0, x1, y1 in d.text_index[space]
                 if layer in visible and x0 - tol <= x <= x1 + tol and y0 - tol <= y <= y1 + tol]
 
     def find_type(self, type_: str | None, layer: str | None, box: BBox | None, limit: int) -> list[str]:
@@ -681,9 +762,15 @@ class Session:
     def bbox_of(self, handles: list[str]) -> BBox | None:
         doc = self.doc()
         boxes = []
+        through = self.drawing.through
         for h in self._with_stand_ins(handles[:2000]):
             e = deep.entity_by_handle(doc, h) if doc is not None else None
             bb = deep.entity_bbox(e) if e is not None else None
+            vp = deep.entity_by_handle(doc, through[h]) if bb and h in through else None
+            if vp is not None:  # picked through a viewport: frame it where the sheet shows it
+                corners = deep.transform(np.asarray([bb[0], (bb[1][0], bb[0][1]), bb[1], (bb[0][0], bb[1][1])]),
+                                         deep.model_to_paper(vp))
+                bb = (tuple(corners.min(axis=0)), tuple(corners.max(axis=0)))
             if bb:
                 boxes.append(bb)
         if not boxes:
@@ -706,6 +793,220 @@ class Session:
                 row["drawn_for"] = {"handle": src[0], "object": src[1]}
             out.append(row)
         return out
+
+    # -- comparing versions ----------------------------------------------------------
+    def compare(self, baseline: str, tolerance: float | None = None) -> Comparison:
+        """Compare the open drawing with another version of it (`baseline`, usually the earlier
+        revision). Changes are drawn over the dimmed drawing until clear_comparison()."""
+        with self._lock:
+            d = self.drawing
+            src = Path(baseline).expanduser()
+            if not src.is_absolute():
+                src = Path.cwd() / src
+            if not src.exists():
+                raise ViewerError(f"File not found: {src}")
+            doc = self.doc()
+            if doc is None:
+                raise ViewerError("The open drawing could not be read as DXF data, so it cannot be compared.")
+            with contextlib.redirect_stdout(sys.stderr):
+                old_doc, _ = deep.load(self._baseline_dxf(src))
+                if d.proxy_origin:
+                    # compare the DXF as it was before stand-ins were added (same entities and
+                    # handles), so both versions come from the same writer
+                    doc, _ = deep.load(self._baseline_dxf(d.source))
+            if tolerance is None:
+                (x0, y0), (x1, y1) = d.extents
+                tolerance = max(math.hypot(x1 - x0, y1 - y0) * 1e-7, 1e-9)
+            elif tolerance <= 0:
+                raise ViewerError("tolerance must be positive")
+            changes, unchanged = diff.compare(doc, old_doc, tolerance)
+            regions = diff.regions(changes)
+            d.comparison = Comparison(src, old_doc, tolerance, changes, regions, unchanged)
+            d.selection = []
+            self.annotate()
+            return d.comparison
+
+    def _baseline_dxf(self, src: Path) -> Path:
+        """The DXF to read for a baseline, made the way open() makes it, so both versions go
+        through the same conversion (and share the cache with opening that file)."""
+        cache = paths.cache_dir()
+        key = _cache_key(src)
+        suffix = src.suffix.lower()
+        if suffix == ".dwg" or (suffix == ".dxf" and not deep.has_handles(src)):
+            out = cache / f"{'dwg' if suffix == '.dwg' else 'dxf'}-{key}.dxf"
+            if not out.exists():
+                cc = CadCraft()  # a second engine, so the open drawing stays as it is
+                try:
+                    cc.call("open", {"path": str(src)})
+                    cc.call("save", {"path": str(out)})
+                finally:
+                    cc.close()
+            return out
+        if suffix == ".dxf" or not gerber.looks_like_gerber(src):
+            return src
+        out, meta = cache / f"gerber-{key}.dxf", cache / f"gerber-{key}.json"
+        if not out.exists() or not meta.exists():
+            with contextlib.redirect_stdout(sys.stderr):
+                meta.write_text(json.dumps(gerber.convert(src, out)), encoding="utf-8")
+        return out
+
+    def clear_comparison(self) -> None:
+        with self._lock:
+            self.drawing.comparison = None
+
+    def _comparison(self) -> Comparison:
+        c = self.drawing.comparison
+        if c is None:
+            raise ViewerError("No comparison is active. Call compare(baseline=...) first.")
+        return c
+
+    def comparison_summary(self) -> dict[str, Any]:
+        c = self._comparison()
+        kinds = Counter(ch.kind for ch in c.changes)
+        by_type: dict[str, Counter] = defaultdict(Counter)
+        by_layer: dict[str, Counter] = defaultdict(Counter)
+        blocks: Counter = Counter()
+        for ch in c.changes:
+            by_type[ch.type][ch.kind] += 1
+            by_layer[ch.layer][ch.kind] += 1
+            if "block_content" in ch.what.get("changed", {}):
+                e = deep.entity_by_handle(self.doc(), ch.handle) if ch.handle else None
+                blocks[e.dxf.name if e is not None else "?"] += 1
+        out: dict[str, Any] = {
+            "baseline": str(c.baseline),
+            "added": kinds["added"], "removed": kinds["removed"], "changed": kinds["changed"],
+            "unchanged": c.unchanged, "tolerance": float(f"{c.tolerance:.3g}"),
+        }
+        if not c.changes:
+            out["note"] = "No differences: every entity matches the baseline within the tolerance."
+            return out
+        out["by_type"] = {t: dict(n) for t, n in sorted(by_type.items(), key=lambda kv: -sum(kv[1].values()))[:20]}
+        out["by_layer"] = {l: dict(n) for l, n in sorted(by_layer.items(), key=lambda kv: -sum(kv[1].values()))[:20]}
+        if blocks:
+            out["block_definitions_changed"] = {name: f"{n} references" for name, n in blocks.items()}
+        out["regions"] = [self._region_row(r) for r in c.regions[:60]]
+        if len(c.regions) > 60:
+            out["regions_not_listed"] = len(c.regions) - 60
+        unplaced = sum(1 for ch in c.changes if ch.bbox is None)
+        if unplaced:
+            out["without_position"] = unplaced
+        return out
+
+    def _region_row(self, r: diff.Region) -> dict[str, Any]:
+        kinds = Counter(self.drawing.comparison.changes[i].kind for i in r.members)
+        row: dict[str, Any] = {"region": r.n}
+        if r.space != "Model":
+            row["layout"] = r.space
+        row["box"] = [[round(v, 6) for v in r.box[0]], [round(v, 6) for v in r.box[1]]]
+        row.update({k: kinds[k] for k in ("added", "removed", "changed") if kinds[k]})
+        return row
+
+    def goto_region(self, n: int) -> dict[str, Any]:
+        """Zoom to a numbered region of the comparison (switching layout if needed) and list
+        what changed there."""
+        with self._lock:
+            c = self._comparison()
+            region = next((r for r in c.regions if r.n == n), None)
+            if region is None:
+                raise ViewerError(f"No region {n}; regions are 1..{len(c.regions)}.")
+            if region.space != self.drawing.layout:
+                self.set_layout(region.space)
+            (x0, y0), (x1, y1) = region.box
+            pad = max(x1 - x0, y1 - y0) * 0.25 or self.drawing.view.scale * 60
+            self._set_view(self.drawing.view.fit(((x0 - pad, y0 - pad), (x1 + pad, y1 + pad)), margin=0))
+            rows = [self.change_row(i) for i in sorted(region.members, key=lambda i: (c.changes[i].kind,
+                                                                                    c.changes[i].type))]
+            out = {**self._region_row(region), "changes": rows[:80]}
+            if len(rows) > 80:
+                out["changes_not_listed"] = len(rows) - 80
+            return out
+
+    def change_row(self, i: int) -> dict[str, Any]:
+        """One change as JSON: what it is, its handles, and what differs."""
+        c = self._comparison()
+        ch = c.changes[i]
+        row: dict[str, Any] = {"kind": ch.kind, "type": ch.type, "layer": ch.layer}
+        if ch.handle:
+            row["handle"] = ch.handle
+        if ch.baseline_handle:
+            row["baseline_handle"] = ch.baseline_handle
+        if ch.kind == "changed":
+            row.update(ch.what)
+        else:
+            doc = self.doc() if ch.kind == "added" else c.doc
+            e = deep.entity_by_handle(doc, ch.handle or ch.baseline_handle) if doc is not None else None
+            if e is not None:
+                row.update({k: v for k, v in deep.summary(e).items() if k not in ("handle", "type", "layer")})
+        return row
+
+    def changes_at(self, p: Point, tol: float) -> list[dict]:
+        """Changes drawn within `tol` of a point in the current space (old or new version)."""
+        d = self.drawing
+        c = d.comparison
+        if c is None:
+            return []
+        doc = self.doc()
+        hits = []
+        for i, ch in enumerate(c.changes):
+            if ch.space != d.layout or ch.bbox is None:
+                continue
+            (x0, y0), (x1, y1) = ch.bbox
+            if not (x0 - tol <= p[0] <= x1 + tol and y0 - tol <= p[1] <= y1 + tol):
+                continue
+            dist = math.inf
+            for h, src in ((ch.handle, doc), (ch.baseline_handle, c.doc)):
+                e = deep.entity_by_handle(src, h) if h and src is not None else None
+                if e is not None:
+                    dist = min(dist, deep.distance(e, p))
+            if dist <= tol * 1.5:
+                hits.append((dist, i))
+        hits.sort()
+        return [{**self.change_row(i), "region": c.changes[i].region} for _, i in hits[:8]]
+
+    def describe_baseline(self, handles: list[str]) -> list[dict]:
+        c = self._comparison()
+        out = []
+        for h in handles:
+            e = deep.entity_by_handle(c.doc, h)
+            out.append(deep.detail(c.doc, e) if e is not None else {"handle": h, "note": "not in the baseline"})
+        return out
+
+    def _diff_overlay(self) -> tuple[list, list]:
+        """(kind, polylines) for the changes in view, and the region boxes of this space."""
+        d = self.drawing
+        c = d.comparison
+        doc = self.doc(wait=120)
+        (vx0, vy0), (vx1, vy1) = d.view.window
+        known = {l["name"] for l in d.layers}
+        visible = self._visible_layers()
+        out: list = []
+        drawn = 0
+        for i, ch in enumerate(c.changes):
+            if ch.space != d.layout or ch.bbox is None or (ch.layer in known and ch.layer not in visible):
+                continue
+            (bx0, by0), (bx1, by1) = ch.bbox
+            if bx1 < vx0 or bx0 > vx1 or by1 < vy0 or by0 > vy1:
+                continue
+            if i not in c.shapes:
+                shapes = []
+                if ch.baseline_handle:
+                    e = deep.entity_by_handle(c.doc, ch.baseline_handle)
+                    if e is not None:
+                        shapes.append(("was" if ch.kind == "changed" else "removed", deep.polylines(e)))
+                if ch.handle and doc is not None:
+                    lines = []
+                    for part in d.stand_ins.get(ch.handle) or [ch.handle]:
+                        e = deep.entity_by_handle(doc, part)
+                        if e is not None:
+                            lines += deep.polylines(e)
+                    shapes.append((ch.kind, lines))
+                c.shapes[i] = shapes
+            out += c.shapes[i]
+            drawn += 1
+            if drawn >= 5000:
+                break
+        regions = [(r.box, str(r.n)) for r in c.regions if r.space == d.layout]
+        return out, regions
 
     # -- raw command passthrough -----------------------------------------------------
     def command(self, command: str, params: dict | None) -> Any:

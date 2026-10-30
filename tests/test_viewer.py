@@ -1,6 +1,7 @@
 """End-to-end tests through CADCraft (skipped when the runtime is not installed)."""
 
 import io
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,6 +112,28 @@ class LayoutTest(unittest.TestCase):
     def test_unknown_layout(self):
         with self.assertRaises(ViewerError):
             self.s.set_layout("Layout9")
+
+    def test_click_and_measure_through_viewport(self):
+        self.s.set_layout("A3 圖紙")
+        try:
+            ranked = self.s.pick((320, 220))  # right hole's edge, in the half-scale detail view
+            self.assertTrue(ranked)
+            h = ranked[0][0]
+            row = self.s.describe([h])[0]
+            self.assertEqual((row["type"], row["center"], row["radius"]), ("CIRCLE", [90.0, 30.0], 10))
+            through = self.s.through_viewport(h, (320, 220))
+            self.assertEqual((through["paper_units_per_model_unit"], through["model_point"]), (0.5, [100.0, 30.0]))
+            box = self.s.bbox_of([h])  # where the sheet shows it
+            self.assertAlmostEqual(box[0][0], 310, places=3)
+            self.assertAlmostEqual(box[1][0], 320, places=3)
+            self.s.drawing.selection = [h]
+            png, _ = self.s.frame()
+            self.assertTrue(png.startswith(b"\x89PNG"))
+            vp, model = self.s.to_model([(285, 220), (315, 220)])
+            self.assertAlmostEqual(math.dist(*model), 60)  # 30 mm on paper at 1:2
+            self.assertIsNone(self.s.to_model([(285, 220), (100, 150)]))  # two different viewports
+        finally:
+            self.s.set_layout("Model")
 
 
 @unittest.skipUnless(HAVE_ENGINE, "CADCraft runtime not installed (run install.ps1 / install.sh)")

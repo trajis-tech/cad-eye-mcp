@@ -156,6 +156,8 @@ def _layers_from(path: Path) -> tuple[list[_Layer], str]:
     for f in getattr(stack, "_drill_layers", []):
         fname = Path(str(getattr(f, "original_path", "") or "drill")).name
         layers.setdefault("Drill", _Layer(*DRILL_STYLE["other"], fname)).files.append((fname, f))
+    if getattr(stack, "tmpdir", None) is not None:
+        stack.tmpdir.cleanup()  # a zip's files, unpacked by gerbonara; all parsed by now
     return sorted(layers.values(), key=lambda l: l.order), stack.board_name or path.stem
 
 

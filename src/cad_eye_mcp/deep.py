@@ -491,6 +491,78 @@ def table_rows(e) -> list[list[str]]:
     return rows
 
 
+def viewport_at(doc: Drawing, layout: str, p: Point):
+    """The viewport of a paper-space layout that shows model space at paper point `p` (the
+    smallest one if several overlap), or None. Only plan views (looking down the z axis) count:
+    they map paper to model coordinates by scale, rotation and offset."""
+    best, best_area = None, math.inf
+    for vp in space(doc, layout).query("VIEWPORT"):
+        dx = vp.dxf
+        if dx.get("id", 0) == 1 or dx.get("status", 1) <= 0:
+            continue  # the sheet itself, or switched off
+        direction = dx.get("view_direction_vector", (0, 0, 1))
+        if abs(direction[0]) > 1e-9 or abs(direction[1]) > 1e-9 or direction[2] <= 0:
+            continue
+        w, h = dx.width, dx.height
+        if abs(p[0] - dx.center.x) <= w / 2 and abs(p[1] - dx.center.y) <= h / 2 and w * h < best_area:
+            best, best_area = vp, w * h
+    return best
+
+
+def model_to_paper(vp) -> np.ndarray:
+    """3x3 matrix taking model-space [x, y, 1] rows to paper space through a viewport."""
+    m = vp.get_transformation_matrix()
+    r = [list(row) for row in m.rows()]
+    return np.asarray([[r[0][0], r[0][1], 0], [r[1][0], r[1][1], 0], [r[3][0], r[3][1], 1]])
+
+
+def transform(pts: np.ndarray, m: np.ndarray) -> np.ndarray:
+    return (np.c_[pts[:, :2], np.ones(len(pts))] @ m)[:, :2]
+
+
+def viewport_box(vp) -> BBox:
+    c, w, h = vp.dxf.center, vp.dxf.width, vp.dxf.height
+    return (c.x - w / 2, c.y - h / 2), (c.x + w / 2, c.y + h / 2)
+
+
+def clip(pts: np.ndarray, box: BBox) -> list[np.ndarray]:
+    """Parts of a polyline inside a rectangle (Liang-Barsky on every segment)."""
+    (x0, y0), (x1, y1) = box
+    parts: list[list] = []
+    cur: list = []
+    for (ax, ay), (bx, by) in zip(pts[:-1], pts[1:]):
+        dx, dy = bx - ax, by - ay
+        t0, t1 = 0.0, 1.0
+        for pq, qq in ((-dx, ax - x0), (dx, x1 - ax), (-dy, ay - y0), (dy, y1 - ay)):
+            if pq == 0:
+                if qq < 0:
+                    t0, t1 = 1.0, 0.0
+                    break
+                continue
+            t = qq / pq
+            if pq < 0:
+                t0 = max(t0, t)
+            else:
+                t1 = min(t1, t)
+        if t0 > t1:
+            if cur:
+                parts.append(cur)
+                cur = []
+            continue
+        a, b = (ax + t0 * dx, ay + t0 * dy), (ax + t1 * dx, ay + t1 * dy)
+        if not cur or cur[-1] != a:
+            if cur:
+                parts.append(cur)
+            cur = [a]
+        cur.append(b)
+        if t1 < 1.0:
+            parts.append(cur)
+            cur = []
+    if cur:
+        parts.append(cur)
+    return [np.asarray(c) for c in parts if len(c) >= 2]
+
+
 def space(doc: Drawing, layout: str = "Model"):
     """Model space, or the paper-space layout of that name."""
     return doc.modelspace() if layout.lower() == "model" else doc.layouts.get(layout)

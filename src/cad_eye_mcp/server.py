@@ -35,7 +35,10 @@ Good habits: start from the overview, zoom into regions before judging small det
 pads, dimensions), click an object to get its exact data instead of estimating from pixels, and
 isolate layers when a region is crowded. If the drawing has paper-space layouts (see the notes
 from open_drawing), switch to them with layout: sheets, title blocks and drawing views are often
-there rather than in model space. Files are never modified."""
+there rather than in model space; clicking or measuring inside a viewport there reaches the
+model-space part behind it, at the viewport's scale. To review a revision, open the new version and call compare
+with the old one: differences are drawn in colour and grouped into numbered regions to visit
+one by one. Files are never modified."""
 
 mcp = MCPServer(name="cad-eye", title="cad-eye CAD viewer", version=__version__, instructions=INSTRUCTIONS)
 session = Session()
@@ -191,20 +194,31 @@ def click(
     p = session.point(x, y, coords)
     ranked = session.pick(p, tolerance_px)
     d = session.drawing
+    changes =session.changes_at(p, tolerance_px * d.view.scale)
     if not ranked:
         if not add:
             d.selection = []
-        return _screen({"clicked_at": [round(p[0], 6), round(p[1], 6)], "picked": None,
-                        "note": "nothing visible within the pick box; zoom in or raise tolerance_px"})
+        out = {"clicked_at": [round(p[0], 6), round(p[1], 6)], "picked": None,
+               "note": "nothing visible within the pick box; zoom in or raise tolerance_px"}
+        if changes:
+            out["changes_here"] = changes
+            out["note"] = "only a removed entity of the baseline is here (see changes_here)"
+        return _screen(out)
     best = ranked[0][0]
     d.selection = (d.selection + [best]) if add and best not in d.selection else [best]
     picked = session.describe([best], full=True)[0]
+    through = session.through_viewport(best, p)
+    if through:
+        picked["through_viewport"] = through
     alts = []
     for h, dist in ranked[1:8]:
         s = session.describe([h])[0]
         s["distance"] = None if math.isinf(dist) else round(dist, 6)
         alts.append(s)
-    return _screen({"clicked_at": [round(p[0], 6), round(p[1], 6)], "picked": picked, "also_here": alts})
+    out = {"clicked_at": [round(p[0], 6), round(p[1], 6)], "picked": picked, "also_here": alts}
+    if changes:
+        out["changes_here"] = changes
+    return _screen(out)
 
 
 @mcp.tool(annotations=VIEW_TOOL, structured_output=False)
@@ -255,13 +269,16 @@ def clear() -> list:
 @_guard
 def inspect(
     handles: Annotated[list[str] | None, Field(description="Entity handles; default: the selection")] = None,
+    baseline: Annotated[bool, Field(description="Look the handles up in the baseline drawing of the "
+                                                "current comparison (baseline_handle values)")] = False,
 ) -> str:
     """Full data of entities: every DXF attribute, effective colour, bounding box, length/area,
     block content and attributes. Text only, no image."""
-    hs = handles or session.drawing.selection
+    hs = handles or ([] if baseline else session.drawing.selection)
     if not hs:
         raise ValueError("Nothing to inspect: pass handles or select something first.")
-    return json.dumps(session.describe(hs[:25], full=True), ensure_ascii=False, indent=1, default=str)
+    rows = session.describe_baseline(hs[:25]) if baseline else session.describe(hs[:25], full=True)
+    return json.dumps(rows, ensure_ascii=False, indent=1, default=str)
 
 
 @mcp.tool(annotations=VIEW_TOOL, structured_output=False)
@@ -344,6 +361,16 @@ def measure(
     out: dict[str, Any] = {"segments": segs, "total": round(total, 6), "units": d.units}
     if len(pts) >= 3:
         out["area_closed"] = round(deep.polygon_area(np.asarray(pts)), 6)
+    model = session.to_model(pts)
+    if model is not None:  # all points inside one viewport: the same measure on the part itself
+        vp, mpts = model
+        mlen = [math.dist(a, b) for a, b in zip(mpts, mpts[1:])]
+        out["model_space"] = {"viewport": vp.dxf.handle, "paper_units_per_model_unit": round(vp.get_scale(), 6),
+                              "points": [[round(x, 6), round(y, 6)] for x, y in mpts],
+                              "distances": [round(v, 6) for v in mlen], "total": round(sum(mlen), 6),
+                              "units": d.model_units}
+        if len(mpts) >= 3:
+            out["model_space"]["area_closed"] = round(deep.polygon_area(np.asarray(mpts)), 6)
     session.annotate(markers=[(p, f"P{i + 1}") for i, p in enumerate(pts)], lines=[pts])
     return _screen({"measure": out})
 
@@ -379,9 +406,43 @@ def layout(
     extra: dict[str, Any] = {"layout": d.layout, "units": d.units, "entity_counts": d.counts,
                              "extents": [list(d.extents[0]), list(d.extents[1])]}
     if d.counts.get("Viewport"):
-        extra["hint"] = ("What viewports show is model space seen through a window: it is drawn here but "
-                         "not clickable. Switch to Model to click, inspect or measure it.")
+        extra["hint"] = ("Viewports show model space through a window. Clicking inside one picks the model "
+                         "entity (reported with through_viewport), and measuring inside one also gives "
+                         "model-space distances. Box selection and find work on the sheet only.")
     return _screen(extra)
+
+
+@mcp.tool(annotations=VIEW_TOOL, structured_output=False)
+@_guard
+def compare(
+    baseline: Annotated[str | None, Field(description="Absolute path of the other version to compare the "
+                                                      "open drawing with, usually the previous revision "
+                                                      "(DXF, DWG, or Gerber file/folder/zip)")] = None,
+    region: Annotated[int | None, Field(description="Zoom to this numbered region of the current "
+                                                    "comparison and list its changes")] = None,
+    tolerance: Annotated[float | None, Field(description="Coordinates closer than this (drawing units) "
+                                                         "count as equal; default 1e-7 of the drawing size")] = None,
+    clear: Annotated[bool, Field(description="End the comparison and show the drawing normally")] = False,
+) -> list:
+    """Compare the open drawing with another version of it, like a drawing-compare tool. The
+    drawing is dimmed and the differences drawn over it: added entities green, removed ones red
+    (drawn from the baseline), changed ones blue with their old version in thin red. Changes are
+    grouped into numbered regions (#1, #2... on screen); call compare(region=n) to zoom to one and
+    read exactly what changed (moved by, old -> new attribute values, edited text, block
+    definitions). Entities are matched by content, so files re-saved by other programs compare too."""
+    d = session.drawing
+    if clear:
+        session.clear_comparison()
+        return _screen({"compare": "cleared"})
+    if baseline:
+        session.compare(baseline, tolerance)
+        session.zoom_extents()
+        return _screen({"compare": session.comparison_summary()})
+    if region is not None:
+        return _screen({"compare_region": session.goto_region(region)})
+    if d.comparison is None:
+        raise ValueError("Give the baseline path of the version to compare with.")
+    return _screen({"compare": session.comparison_summary()})
 
 
 @mcp.tool(annotations=VIEW_TOOL, structured_output=False)
