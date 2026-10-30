@@ -163,6 +163,13 @@ class SolidsTest(unittest.TestCase):
     def test_find_by_type_lists_both_solids(self):
         self.assertEqual(sorted(self.s.find_type("3DSOLID", None, None, 10)), ["2F", "30"])
 
+    def test_check_gives_the_reason(self):
+        report, _ = self.s.check()
+        self.assertTrue(report["verdict"].startswith("incomplete"))
+        broken = [g for g in report["not_drawn"] if "30" in g["handles"]][0]
+        self.assertIn("ACIS data unreadable", broken["reason"])
+        self.assertIn("run check", self.s._status()[1])
+
     def test_nothing_drawable_stays_in_model_space(self):
         with tempfile.TemporaryDirectory() as tmp:
             doc = ezdxf.new("R2018")
@@ -176,6 +183,69 @@ class SolidsTest(unittest.TestCase):
                 self.assertTrue(any(n.startswith("Nothing in this drawing can be drawn") for n in d.notes))
             finally:
                 s.close()
+
+
+def with_gaps(path: Path) -> None:
+    """A drawing with everything the screen can miss: a missing xref, an image whose file is
+    gone, layers switched off and frozen, an invisible entity and a sheet with its own content."""
+    doc = ezdxf.new("R2018", setup=True)
+    msp = doc.modelspace()
+    msp.add_lwpolyline([(0, 0), (100, 0), (100, 60), (0, 60)], close=True)
+    doc.layers.add("HIDDEN").off()
+    doc.layers.add("FROZEN").freeze()
+    msp.add_line((10, 10), (40, 10), dxfattribs={"layer": "HIDDEN"})
+    msp.add_circle((50, 30), 5, dxfattribs={"layer": "FROZEN"})
+    msp.add_line((10, 20), (40, 20), dxfattribs={"invisible": 1})
+    image = doc.add_image_def(filename="site_photo.png", size_in_pixel=(640, 480))
+    msp.add_image(image, insert=(60, 5), size_in_units=(30, 20))
+    doc.add_xref_def("missing_part.dwg", "PART")
+    msp.add_blockref("PART", (0, 0))
+    doc.layouts.new("Sheet").add_text("TITLE BLOCK", height=5).set_placement((10, 10))
+    doc.saveas(path)
+
+
+@unittest.skipUnless(HAVE_ENGINE, "CADCraft runtime not installed (run install.ps1 / install.sh)")
+class CheckTest(unittest.TestCase):
+    """check(): what the screen does not show, and why."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.path = Path(cls.tmp.name) / "gaps.dxf"
+        with_gaps(cls.path)
+        cls.s = Session()
+        cls.s.open(str(cls.path))
+        cls.report, cls.marks = cls.s.check()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.s.close()
+        cls.tmp.cleanup()
+
+    def test_verdict_and_status_bar(self):
+        self.assertTrue(self.report["verdict"].startswith("incomplete"))
+        self.assertIn("1 object not shown: run check", self.s._status()[1])
+
+    def test_missing_files(self):
+        refs = self.report["references"]
+        self.assertTrue(refs["xrefs_not_found"][0].startswith("PART"))
+        self.assertEqual(refs["files_not_found"][0]["file"], "site_photo.png")
+        self.assertIn("missing file: IMAGE", [label for _, label, _ in self.marks])
+
+    def test_hidden_content(self):
+        self.assertEqual(self.report["hidden"], {"layers_off": {"HIDDEN": 1}, "layers_frozen": {"FROZEN": 1},
+                                                 "invisible_entities": 1})
+        self.assertEqual(self.report["other_spaces"], {"Sheet": 1})
+
+    def test_clean_drawing_is_complete(self):
+        s = Session()
+        try:
+            s.open(str(FIXTURE))
+            report, marks = s.check()
+        finally:
+            s.close()
+        self.assertTrue(report["verdict"].startswith("complete"), report)
+        self.assertEqual(marks, [])
 
 
 if __name__ == "__main__":

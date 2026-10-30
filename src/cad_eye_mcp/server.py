@@ -36,7 +36,10 @@ pads, dimensions), click an object to get its exact data instead of estimating f
 isolate layers when a region is crowded. If the drawing has paper-space layouts (see the notes
 from open_drawing), switch to them with layout: sheets, title blocks and drawing views are often
 there rather than in model space; clicking or measuring inside a viewport there reaches the
-model-space part behind it, at the viewport's scale. To review a revision, open the new version and call compare
+model-space part behind it, at the viewport's scale. Not everything in a file can always be
+drawn (custom objects, some 3D solids, missing xrefs): the status bar says so, and check tells
+what is missing, where and why, so run check before concluding that something is absent. To
+review a revision, open the new version and call compare
 with the old one: differences are drawn in colour and grouped into numbered regions to visit
 one by one. Files are never modified."""
 
@@ -90,8 +93,12 @@ def open_drawing(
         info["hint"] = "PCB layers are DXF layers; mask/paste/bottom silk start hidden (see layers)."
     if d.unsupported:
         info["not_drawn"] = d.unsupported
+    if d.engine_skipped:
+        info["not_read_by_engine"] = d.engine_skipped
     if d.notes:
         info["notes"] = d.notes
+    if d.unsupported or d.engine_skipped or d.missing_xrefs:
+        info["check"] = "Part of this file is not on screen: run check for what, where and why."
     return _screen(info)
 
 
@@ -410,6 +417,25 @@ def layout(
                          "entity (reported with through_viewport), and measuring inside one also gives "
                          "model-space distances. Box selection and find work on the sheet only.")
     return _screen(extra)
+
+
+@mcp.tool(annotations=VIEW_TOOL, structured_output=False)
+@_guard
+def check(
+    show: Annotated[bool, Field(description="Mark the problems that have a position in the current view's "
+                                            "space (orange markers with a box)")] = True,
+) -> list:
+    """Completeness and integrity report: what of the file the screen does not show, and why.
+    Lists entities that cannot be drawn (with the reason and their handles), entities the engine
+    could not read, external references and images whose files are missing, hidden layers,
+    invisible entities, layers frozen in viewports, content in other layouts, problems in the
+    file's structure (audit, nothing is changed) and, for PCBs, Gerber objects or files that
+    were not converted. Starts with a verdict; run it before concluding that something is
+    absent from a drawing."""
+    report, marks = session.check()
+    if show and marks:
+        session.annotate(markers=[(p, label) for p, label, _ in marks], boxes=[b for _, _, b in marks if b])
+    return _screen({"check": report})
 
 
 @mcp.tool(annotations=VIEW_TOOL, structured_output=False)

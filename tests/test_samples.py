@@ -65,6 +65,9 @@ class SampleTest(unittest.TestCase):
         dims = self.s.describe(self.s.find_type("Dimension", None, None, 50))
         self.assertEqual(len(dims), 17)
         self.assertIn("SHAFTid=3\"", [x["text"] for x in dims])
+        report, _ = self.s.check()  # parametric constraints refer to dimension blocks the file lacks
+        self.assertEqual(report["file_structure"]["audit_issues"], 17)
+        self.assertTrue(report["verdict"].startswith("complete"))
 
     def test_sheet_with_tables_dwg(self):
         d = self.open("mech/blocks_and_tables_-_metric.dwg")
@@ -100,6 +103,12 @@ class SampleTest(unittest.TestCase):
         # the same file compared with itself: stand-ins and xrefs must not show up as changes
         c = self.s.compare(str(SAMPLES / "mech/DRYER_ASSEMBLY.dwg"))
         self.assertEqual((c.changes, c.unchanged > 2000), ([], True))
+        report, _ = self.s.check()
+        self.assertTrue(report["verdict"].startswith("incomplete"))
+        reasons = {g["reason"] for g in report["not_drawn"] if g["type"] == "ACAD_PROXY_ENTITY"}
+        self.assertTrue(reasons and all("proxy graphics" in r for r in reasons), reasons)
+        self.assertIn("custom object ACAMCOMPENT has empty proxy graphics (typical of 3D-only data): only the "
+                      "application that made it can draw it", reasons)
 
     # -- entity types CADCraft does not draw -----------------------------------------------------
     def test_uncommon_types(self):
@@ -108,6 +117,10 @@ class SampleTest(unittest.TestCase):
         arc_dim = self.s.describe(self.s.find_type("ARC_DIMENSION", None, None, 5))[0]
         self.assertAlmostEqual(arc_dim["measurement"], 8.549711, places=4)  # arc length, not the angle
         self.assertTrue(d.stand_ins.get(arc_dim["handle"]), "the arc dimension must be drawn")
+        # the engine silently drops a polyface mesh without faces; check() names it
+        report, _ = self.s.check()
+        self.assertIn({"handle": "4D7", "type": "POLYLINE", "layer": "0", "space": "Model", "kind": "Polyface"},
+                      report["dropped_by_engine"])
 
     def test_table_metadata(self):
         self.open("dxf/ezdxf_acad_table.dxf")
@@ -125,6 +138,9 @@ class SampleTest(unittest.TestCase):
         d = self.open("gerber/clockblock")
         hidden = {l["name"] for l in d.layers if not l.get("on", True)}
         self.assertTrue({"F.Mask", "B.Mask", "F.Paste"} <= hidden)
+        report, _ = self.s.check()
+        self.assertEqual(report["pcb"]["files_not_used"], ["LICENSE"])
+        self.assertIn("F.Mask", report["hidden"]["layers_off"])
         self.s.set_layers("isolate", ["F.Cu"])
         visible = {l["name"] for l in self.s.drawing.layers if l.get("on", True) and not l.get("frozen")}
         self.assertEqual(visible, {"F.Cu"})

@@ -9,6 +9,7 @@ cad-eye 1.0.0, Windows AMD64, 2026-10-30. Files come from `scripts/fetch_samples
 | Open a Gerber/Excellon board | clockblock (tracespace fixture) | error: invalid parameters for `open`: unsupported file type `gbr` | 10 PCB layers, 49,588 entities |
 | Draw entity types CADCraft keeps as opaque proxies | ezdxf uncommon.dxf | 5 not drawn (3DSOLID, ARC_DIMENSION, LARGE_RADIAL_DIMENSION, MESH) | 4 drawn by stand-ins; reported as not drawn (blocks included): 3DSOLID x2 |
 | Read an arc dimension's value | ezdxf uncommon.dxf | raw DXF tags only (no value) | arc length 8.5497 |
+| Say what the engine could not read | ezdxf uncommon.dxf | inspect_drawing: skipped {"count": 1, "sections": {"ENTITIES": 1}} | check: POLYLINE 4D7 (Polyface); not drawn: ACIS data unreadable (encrypted, damaged or in a f... |
 | Show the assembly sheet (AutoCAD Mechanical proxies) | NIST blow dryer assembly, Layout2 | 0 entities drawn (1 proxy not drawn) | 2,683 entities drawn (proxy graphics) |
 | Find a text that is inside a table cell | Autodesk blocks_and_tables (metric) | find_text: 0 hits (tables: cells readable via query_entities, 2 tables) | find: 1 table row ('1 \| 0.80 \| 1.2 m \| CASEMENT \| CN14 \| AND...') |
 | Read dimension texts (parity check) | Autodesk mechanical example (imperial) | 17 of 17 with text | 17 of 17 with text |
@@ -16,7 +17,7 @@ cad-eye 1.0.0, Windows AMD64, 2026-10-30. Files come from `scripts/fetch_samples
 | Measure across that viewport | tests/fixtures/sheet_layout.dxf | 30 (paper units only) | 30 on paper = 60 in model space |
 | Compare two revisions (same handles) | bracket A -> B: 9 known edits, one on the sheet | +1 -1 ~6; changes described as ['geometry'] | +1 -1 ~7; e.g. {"type": "CIRCLE", "changed": {"radius": [10.0, 12.0]}}; {"type": "CIRCLE", "moved": [20.0, 10.0]} |
 | Compare two revisions (re-exported, handles renumbered) | bracket A -> B: 9 known edits, one on the sheet | +6 -6 ~1; changes described as ['geometry'] | +1 -1 ~7; e.g. {"type": "CIRCLE", "moved": [20.0, 10.0]}; {"type": "INSERT", "changed": {"attributes": [[["DWG_NO", "M-100", [125.0, -45.0]]], [["DWG_NO", "M-101", [125.0, -45.0]]]]}} |
-| Compare two board revisions (Gerber) | mr-fixit v1.0 -> v1.1 (220,000+ entities) | cannot open Gerber | +3 -2120 ~14, of which on Edge.Cuts: {"changed": 2, "removed": 2092} (43 s to open and compare) |
+| Compare two board revisions (Gerber) | mr-fixit v1.0 -> v1.1 (220,000+ entities) | cannot open Gerber | +3 -2120 ~14, of which on Edge.Cuts: {"changed": 2, "removed": 2092} (46 s to open and compare) |
 | Write files | any | a `save` tool overwrites or exports files | blocked (save, export, plot, open... refused) |
 
 Where both sides return the same data (dimension texts, circle radii, table cells through `query_entities`), cad-eye adds no data of its own: it adds the screen around it (rulers, picking by pixel, highlights, regions) and the rows above. Whether that screen makes a model answer drawing questions better is not measured here.

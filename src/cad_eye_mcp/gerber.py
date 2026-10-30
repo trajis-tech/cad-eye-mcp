@@ -40,6 +40,7 @@ STYLE = {
 DRILL_STYLE = {"pth": ("Drill.PTH", 4, True, 60), "npth": ("Drill.NPTH", 140, True, 61),
                "other": ("Drill", 4, True, 62)}
 CLEAR_COLOR = 250  # "clear" (negative) polarity features are drawn in a near-background colour
+VERSION = 2  # bump when the output or summary changes, so cached conversions are redone
 
 
 def looks_like_gerber(path: Path) -> bool:
@@ -104,6 +105,15 @@ def _manual_stack(files: list[tuple[str, bytes]]) -> tuple[list[_Layer], None]:
             name, color, vis, order = STYLE.get(key, (Path(fname).stem, 8, True, 70))
         layers.setdefault(name, _Layer(name, color, vis, order, fname)).files.append((fname, cam))
     return sorted(layers.values(), key=lambda l: l.order), None
+
+
+def _file_names(path: Path) -> list[str]:
+    if path.is_dir():
+        return sorted(p.name for p in path.iterdir() if p.is_file())
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as z:
+            return sorted(Path(n).name for n in z.namelist() if not n.endswith("/"))
+    return [path.name]
 
 
 def _read_files(path: Path) -> list[tuple[str, bytes]]:
@@ -258,12 +268,13 @@ def convert(path: Path, out_dxf: Path) -> dict:
                 lyr = doc.layers.add(name, color=layer.color if not name.endswith(".clear") else CLEAR_COLOR)
                 if not visible:
                     lyr.off()
-        counts = {"dark": 0, "clear": 0}
+        counts = {"dark": 0, "clear": 0, "skipped": 0}
         for fname, cam in layer.files:
             for obj in cam.objects:
                 try:
                     prims = list(obj.to_primitives(unit=MM))
-                except Exception:  # noqa: BLE001 - skip objects gerbonara cannot expand
+                except Exception:  # noqa: BLE001 - objects gerbonara cannot expand are counted
+                    counts["skipped"] += 1
                     continue
                 for prim in prims:
                     dark = getattr(prim, "polarity_dark", True)
@@ -272,7 +283,9 @@ def convert(path: Path, out_dxf: Path) -> dict:
                     counts["dark" if dark else "clear"] += 1
         summary["layers"].append({"layer": layer.name, "files": [f for f, _ in layer.files],
                                   "visible": layer.visible, "primitives": counts["dark"],
-                                  "clear_primitives": counts["clear"]})
+                                  "clear_primitives": counts["clear"], "skipped_objects": counts["skipped"]})
+    used = {f for layer in layers for f, _ in layer.files}
+    summary["unused_files"] = [n for n in _file_names(path) if n not in used]
     for name in [l.dxf.name for l in doc.layers if l.dxf.name.endswith(".clear")]:
         if not any(True for _ in doc.modelspace().query(f'*[layer=="{name}"]')):
             doc.layers.remove(name)

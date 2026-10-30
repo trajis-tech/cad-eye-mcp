@@ -126,6 +126,12 @@ class Drawing:
     stand_ins: dict[str, list[str]] = field(default_factory=dict)  # original handle -> drawn handles
     comparison: Comparison | None = None
     through: dict[str, str] = field(default_factory=dict)  # model handle -> viewport it was picked in
+    # what the screen cannot show (see Session.check)
+    not_drawn: list[dict] = field(default_factory=list)    # each entity not drawn: handle, where, reason
+    stand_in_summary: dict[str, dict] = field(default_factory=dict)  # by_type, how
+    non_visual: dict[str, int] = field(default_factory=dict)          # e.g. lights: never drawn
+    engine_skipped: int = 0                                # objects the engine could not read at all
+    missing_xrefs: list[str] = field(default_factory=list)
 
 
 def _cache_key(path: Path) -> str:
@@ -209,14 +215,7 @@ class Session:
             cache = paths.cache_dir()
             key = _cache_key(src)
             if kind == "gerber":
-                work = cache / f"gerber-{key}.dxf"
-                meta = cache / f"gerber-{key}.json"
-                if not work.exists() or not meta.exists():
-                    with contextlib.redirect_stdout(sys.stderr):
-                        gsum = gerber.convert(src, work)
-                    meta.write_text(json.dumps(gsum), encoding="utf-8")
-                else:
-                    gsum = json.loads(meta.read_text(encoding="utf-8"))
+                work, gsum = self._gerber_dxf(src)
                 open_path = work
             else:
                 open_path = src
@@ -227,6 +226,11 @@ class Session:
 
             opened = self.cc.call("open", {"path": str(open_path)}).json() or {}
             notes += opened.get("warnings", []) if isinstance(opened, dict) else []
+            # objects the engine could not read from the file at all (none of them is shown)
+            skipped = (self.cc.call("inspect_drawing", {}).json().get("skipped") or {}).get("count", 0)
+            if skipped:
+                notes.append(f"{skipped} objects in the file could not be read by the engine and are not shown; "
+                             "check() tells which, when the file is a DXF")
             if work != open_path and kind != "gerber" and not work.exists():
                 self.cc.call("save", {"path": str(work)})
 
@@ -252,9 +256,12 @@ class Session:
                     notes.append("Custom object classes: " + ", ".join(f"{c} x{n}" for c, n in psum["classes"].items()))
                 if psum["not_drawn"]:
                     notes.append("Not drawn (no geometry, proxy graphic or flat-faced ACIS data to show): "
-                                 + ", ".join(f"{t} x{n}" for t, n in psum["not_drawn"].items()))
-            if kind != "gerber":
-                notes += self._relink_xrefs(src)
+                                 + ", ".join(f"{t} x{n}" for t, n in psum["not_drawn"].items())
+                                 + ". check() lists each one with the reason")
+            missing_xrefs = self._relink_xrefs(src) if kind != "gerber" else []
+            if missing_xrefs:
+                notes.append("External references not found, so their content is not shown: "
+                             + "; ".join(missing_xrefs[:20]) + ". Put those files next to the drawing to see them.")
 
             info = self.cc.call("inspect_drawing", {}).json()
             counts = info.get("counts", {})
@@ -268,8 +275,13 @@ class Session:
                         fit_view(extents, *self.size), notes=notes, gerber_summary=gsum,
                         model_units=units, paper_units=self._layout_units() if kind != "gerber" else {},
                         proxy_origin=psum["origin"] if psum and psum["origin"] else None)
+            d.engine_skipped, d.missing_xrefs = skipped, missing_xrefs
             if psum:
                 d.unsupported = dict(psum["not_drawn"])
+                d.not_drawn = psum.get("skipped", [])
+                d.non_visual = psum.get("non_visual", {})
+                if psum["drawn"]:
+                    d.stand_in_summary = {"by_type": dict(psum["drawn"]), "how": dict(psum["how"])}
                 for new, (orig, _) in psum["origin"].items():
                     d.stand_ins.setdefault(orig, []).append(new)
             if work is not None:
@@ -339,7 +351,8 @@ class Session:
     # -- external references and layouts -------------------------------------------------
     def _relink_xrefs(self, src: Path) -> list[str]:
         """Point xrefs CADCraft could not find at files of the same name next to the source
-        drawing (DWG and proxy conversions are opened from the cache folder). Returns notes."""
+        drawing (DWG and proxy conversions are opened from the cache folder). Returns the ones
+        still missing."""
         try:
             xrefs = (self.cc.execute("xref") or {}).get("xrefs", [])
         except CadCraftError:
@@ -358,10 +371,20 @@ class Session:
                 except CadCraftError:
                     pass
             missing.append(f"{x['name']} ({x.get('path')})")
-        if not missing:
-            return []
-        return ["External references not found, so their content is not shown: " + "; ".join(missing[:20])
-                + ". Put those files next to the drawing to see them."]
+        return missing
+
+    @staticmethod
+    def _gerber_dxf(src: Path) -> tuple[Path, dict]:
+        """The layered DXF made from a Gerber/drill file, folder or zip, and its summary (cached)."""
+        cache = paths.cache_dir()
+        stem = f"gerber{gerber.VERSION}-{_cache_key(src)}"
+        out, meta = cache / f"{stem}.dxf", cache / f"{stem}.json"
+        if out.exists() and meta.exists():
+            return out, json.loads(meta.read_text(encoding="utf-8"))
+        with contextlib.redirect_stdout(sys.stderr):
+            summary = gerber.convert(src, out)
+        meta.write_text(json.dumps(summary), encoding="utf-8")
+        return out, summary
 
     def _layout_units(self) -> dict[str, str]:
         """Paper-space layouts in tab order, each with its paper units (mm or in)."""
@@ -485,6 +508,10 @@ class Session:
                  f"{v.scale:.4g} {d.units}/px  |  zoom {zoom:.3g}x")
         sel = f"selected {len(d.selection)}" + (f" ({', '.join(d.selection[:4])}{'…' if len(d.selection) > 4 else ''})" if d.selection else "")
         line2 = f"layers {on}/{len(d.layers)} visible  |  {sel}  |  px coords = this image's pixels"
+        missing = sum(d.unsupported.values()) + d.engine_skipped + len(d.missing_xrefs)
+        if missing:
+            line2 = (f"layers {on}/{len(d.layers)} visible  |  {sel}  |  "
+                     f"! {missing} {'object' if missing == 1 else 'objects'} not shown: run check")
         if d.comparison is not None:
             n = Counter(ch.kind for ch in d.comparison.changes)
             line2 = (f"compare vs {d.comparison.baseline.name}: +{n['added']} added (green)  "
@@ -794,6 +821,250 @@ class Session:
             out.append(row)
         return out
 
+    # -- completeness ----------------------------------------------------------------
+    def check(self) -> tuple[dict[str, Any], list[tuple[Point, str, BBox | None]]]:
+        """What the screen does not show of the file, and why: entities not drawn (with the
+        reason), entities the engine dropped, hidden layers, other layouts, missing referenced
+        files, structural problems of the file, and for PCBs what the conversion left out.
+        Returns the report and marks (point, label, box) for the problems located in the
+        current space."""
+        with self._lock:
+            d = self.drawing
+            doc = self.doc()
+            ours = set(d.proxy_origin or {})  # stand-ins: added by the viewer, not in the file
+            findings: list[str] = []
+            marks: list[tuple[Point, str, BBox | None]] = []
+            report: dict[str, Any] = {}
+
+            entities: list[tuple[str, Any]] = []
+            per_space: dict[str, int] = {}
+            if doc is not None:
+                for space, sp in diff.spaces(doc):
+                    es = [e for e in sp if e.dxf.handle not in ours]
+                    per_space[space] = len(es)
+                    entities += [(space, e) for e in es]
+            report["entities_in_file"] = per_space
+
+            # 1. not drawn: the engine cannot draw them and nothing could stand in
+            groups: dict[tuple, dict] = {}
+            for r in d.not_drawn:
+                g = groups.setdefault((r["type"], r["reason"]), {"type": r["type"], "count": 0, "reason": r["reason"],
+                                                                 "where": Counter(), "handles": []})
+                g["count"] += 1
+                g["where"][r["where"]] += 1
+                if len(g["handles"]) < 20:
+                    g["handles"].append(r["handle"])
+                if r["where"] == d.layout and r.get("box"):
+                    (x0, y0), (x1, y1) = r["box"]
+                    marks.append((((x0 + x1) / 2, (y0 + y1) / 2), f"not drawn: {r['type']}", ((x0, y0), (x1, y1))))
+            n_not = sum(d.unsupported.values())
+            if n_not:
+                report["not_drawn"] = [{**g, "where": dict(g["where"])} for g in groups.values()]
+                findings.append("Not drawn: " + ", ".join(f"{t} x{n}" for t, n in d.unsupported.items())
+                                + ". Reasons and handles are under not_drawn; inspect works on them.")
+            if d.non_visual:
+                report["not_drawing_content"] = d.non_visual
+                findings.append(", ".join(f"{t} x{n}" for t, n in d.non_visual.items())
+                                + ": lights for 3D renderings, not drawn (AutoCAD does not plot them either).")
+            if d.stand_in_summary:
+                report["drawn_by_stand_ins"] = d.stand_in_summary
+                findings.append("Drawn by stand-ins (" + ", ".join(d.stand_in_summary["how"]) + "): "
+                                + ", ".join(f"{t} x{n}" for t, n in d.stand_in_summary["by_type"].items())
+                                + ". They may look simpler than in the application that made them.")
+
+            # 2. dropped: in the file, but the engine could not read them
+            dropped = self._dropped(entities) if d.kind == "dxf" and doc is not None else []
+            if dropped:
+                report["dropped_by_engine"] = [{k: v for k, v in r.items() if k != "box"} for r in dropped[:50]]
+                kinds = Counter(r["type"] for r in dropped)
+                findings.append("In the file but not read by the engine, so not shown: "
+                                + ", ".join(f"{t} x{n}" for t, n in kinds.items()) + " (see dropped_by_engine).")
+                marks += [(((r["box"][0][0] + r["box"][1][0]) / 2, (r["box"][0][1] + r["box"][1][1]) / 2),
+                           f"not shown: {r['type']}", r["box"]) for r in dropped if r["space"] == d.layout and r["box"]]
+            elif d.engine_skipped:
+                report["dropped_by_engine"] = {"count": d.engine_skipped}
+                findings.append(f"Not read by the engine, so not shown: {d.engine_skipped} objects"
+                                + (" (a DWG is read by the engine itself, so which ones cannot be told)."
+                                   if d.kind == "dwg" else "."))
+
+            # 3. referenced files
+            refs: dict[str, Any] = {}
+            if d.missing_xrefs:
+                refs["xrefs_not_found"] = d.missing_xrefs
+                findings.append("External references not found, so their content is missing: "
+                                + "; ".join(d.missing_xrefs[:5]))
+            for space, e in entities:
+                t = e.dxftype()
+                if t not in ("IMAGE", "PDFUNDERLAY", "DWFUNDERLAY", "DGNUNDERLAY"):
+                    continue
+                try:
+                    definition = e.image_def if t == "IMAGE" else e.get_underlay_def()
+                    name = definition.dxf.filename if definition is not None else ""
+                except Exception:  # noqa: BLE001
+                    name = ""
+                if not self._find_file(name):
+                    refs.setdefault("files_not_found", []).append({"handle": e.dxf.handle, "type": t, "file": name})
+                    bb = deep.entity_bbox(e) if space == d.layout else None
+                    if bb:
+                        marks.append((((bb[0][0] + bb[1][0]) / 2, (bb[0][1] + bb[1][1]) / 2), f"missing file: {t}", bb))
+            if refs.get("files_not_found"):
+                findings.append("Images or underlays whose files are missing: "
+                                + ", ".join(sorted({r['file'] or '?' for r in refs['files_not_found']})[:5]))
+            if refs:
+                report["references"] = refs
+
+            # 4. on purpose out of sight: hidden layers, invisible entities, other layouts
+            state = {l["name"]: l for l in d.layers}
+            off, frozen, invisible = Counter(), Counter(), 0
+            for space, e in entities:
+                l = state.get(e.dxf.layer)
+                if l is not None and l.get("frozen"):
+                    frozen[e.dxf.layer] += 1
+                elif l is not None and not l.get("on", True):
+                    off[e.dxf.layer] += 1
+                invisible += bool(e.dxf.get("invisible", 0))
+            hidden: dict[str, Any] = {}
+            if off or frozen:
+                hidden.update({k: dict(v) for k, v in (("layers_off", off), ("layers_frozen", frozen)) if v})
+                findings.append("On hidden layers: " + ", ".join(f"{n} x{c}" for n, c in (off + frozen).most_common(8))
+                                + ". Show them with layers(action='show', names=[...]).")
+            if invisible:
+                hidden["invisible_entities"] = invisible
+                findings.append(f"Entities flagged invisible in the file (not drawn, as in AutoCAD): {invisible}.")
+            model_layers = Counter(e.dxf.layer for space, e in entities if space == "Model")
+            vp_frozen = {}
+            for name in d.layouts:
+                sp = deep.space(doc, name) if doc is not None else None
+                for vp in (sp.query("VIEWPORT") if sp is not None else []):
+                    names = [n for n in vp.frozen_layers if model_layers.get(n)] if vp.dxf.get("id", 0) != 1 else []
+                    if names:
+                        vp_frozen[f"{name} / viewport {vp.dxf.handle}"] = names
+            if vp_frozen:
+                hidden["frozen_in_viewports"] = vp_frozen
+                findings.append("Viewports that hide some model-space layers: "
+                                + ", ".join(vp_frozen) + " (see frozen_in_viewports).")
+            if hidden:
+                report["hidden"] = hidden
+            undrawn = {r["handle"] for r in d.not_drawn} | {r["handle"] for r in dropped}
+            other = {s: sum(1 for sp, e in entities if sp == s and e.dxftype() != "VIEWPORT"
+                            and e.dxf.handle not in undrawn)
+                     for s in ["Model"] + d.layouts if s != d.layout}
+            other = {s: n for s, n in other.items() if n}
+            if other:
+                report["other_spaces"] = other
+                findings.append("Not on this screen: " + ", ".join(f"layout '{s}' with {n} drawable entities"
+                                                                   if s != "Model" else
+                                                                   f"model space with {n} drawable entities"
+                                                                   for s, n in other.items())
+                                + ". Switch with layout(name=...).")
+
+            # 5. the file itself
+            structure: dict[str, Any] = {}
+            notes = self._load_notes()
+            if notes:
+                structure["read"] = notes
+                findings.append("The DXF data: " + "; ".join(notes))
+            if d.kind != "gerber":
+                try:
+                    audit = self.cc.execute("audit", {"fix": False}) or {}
+                except CadCraftError:
+                    audit = {}
+                issues = [i for i in audit.get("issues", []) if (i.get("handle") or "").upper() not in ours]
+                if issues:
+                    structure["audit_issues"] = len(issues)
+                    structure["issues"] = [{k: i.get(k) for k in ("handle", "kind", "location", "message")}
+                                           for i in issues[:30]]
+                    kinds = Counter(i.get("message") or i.get("kind") for i in issues)
+                    findings.append("Problems in the file found by audit (nothing was changed): "
+                                    + "; ".join(f"{m} x{n}" for m, n in kinds.most_common(5)))
+            if structure:
+                report["file_structure"] = structure
+
+            # 6. PCB conversion
+            pcb_missing = 0
+            if d.gerber_summary:
+                gs = d.gerber_summary
+                pcb: dict[str, Any] = {}
+                skipped = {l["layer"]: l["skipped_objects"] for l in gs["layers"] if l.get("skipped_objects")}
+                clear = {l["layer"]: l["clear_primitives"] for l in gs["layers"] if l.get("clear_primitives")}
+                if skipped:
+                    pcb_missing = sum(skipped.values())
+                    pcb["objects_not_converted"] = skipped
+                    findings.append("Gerber objects that could not be converted, so not shown: "
+                                    + ", ".join(f"{k} x{v}" for k, v in skipped.items()))
+                if gs.get("unused_files"):
+                    pcb["files_not_used"] = gs["unused_files"]
+                    findings.append("Files of the set not recognised as a PCB layer, so not shown: "
+                                    + ", ".join(gs["unused_files"][:8]))
+                if clear:
+                    pcb["clear_polarity_primitives"] = clear
+                    findings.append("Clear (negative) polarity is drawn in a near-background colour on "
+                                    + ", ".join(f"{k}.clear" for k in clear) + ", not cut out of the copper.")
+                if pcb:
+                    report["pcb"] = pcb
+
+            incomplete = bool(n_not or dropped or d.engine_skipped or d.missing_xrefs
+                              or refs.get("files_not_found") or pcb_missing)
+            if incomplete:
+                verdict = ("incomplete: part of the file is not on screen. Before concluding that something is "
+                           "absent from the drawing, read the findings.")
+            elif d.stand_in_summary:
+                verdict = "complete, with stand-ins for objects the engine cannot draw itself"
+            else:
+                verdict = "complete: every entity of the file can be shown"
+            return {"verdict": verdict, "findings": findings or ["nothing to report"], **report}, marks[:60]
+
+    def _dropped(self, entities: list[tuple[str, Any]]) -> list[dict]:
+        """Entities of the DXF that the engine's session does not have (it could not read them)."""
+        d = self.drawing
+        listed: dict[str, set[str]] = {}
+        try:
+            for space in ["Model"] + d.layouts:
+                self.cc.execute("layout.set", {"name": space})
+                info = self.cc.call("inspect_drawing", {"entities": True, "limit": 1_000_000}).json() or {}
+                rows = info.get("entities") or []
+                if len(rows) < sum((info.get("counts") or {}).values()):
+                    return []  # the engine did not list everything: no basis for a comparison
+                listed[space] = {str(r.get("handle", "")).upper() for r in rows}
+        except CadCraftError:
+            return []
+        finally:
+            self.cc.execute("layout.set", {"name": d.layout})
+        out = []
+        for space, e in entities:
+            if space not in listed or e.dxf.handle in listed[space]:
+                continue
+            if e.dxftype() == "VIEWPORT" and e.dxf.get("id", 0) == 1:
+                continue  # the sheet's own viewport
+            try:
+                bb = deep.entity_bbox(e)
+            except Exception:  # noqa: BLE001
+                bb = None
+            row = {"handle": e.dxf.handle, "type": e.dxftype(), "layer": e.dxf.layer, "space": space, "box": bb}
+            if type(e).__name__.upper() != e.dxftype().replace("_", ""):
+                row["kind"] = type(e).__name__  # e.g. a POLYLINE that is a Polyface mesh
+            out.append(row)
+        return out
+
+    def _find_file(self, name: str) -> bool:
+        """Whether a file a drawing refers to exists: as written, next to the drawing, or by name
+        next to the drawing."""
+        if not name:
+            return False
+        p = Path(name)
+        base = name.replace("\\", "/").rsplit("/", 1)[-1]
+        src = self.drawing.source.parent
+        return any(c.is_file() for c in (p, src / name, src / base))
+
+    def _load_notes(self) -> list[str]:
+        d = self.drawing
+        if d.dxf is None:
+            return []
+        try:
+            return list(d.dxf.result(timeout=300)[1])
+        except Exception as e:  # noqa: BLE001
+            return [f"ezdxf could not read the file ({type(e).__name__}: {e}); exact entity data is unavailable"]
+
     # -- comparing versions ----------------------------------------------------------
     def compare(self, baseline: str, tolerance: float | None = None) -> Comparison:
         """Compare the open drawing with another version of it (`baseline`, usually the earlier
@@ -844,11 +1115,7 @@ class Session:
             return out
         if suffix == ".dxf" or not gerber.looks_like_gerber(src):
             return src
-        out, meta = cache / f"gerber-{key}.dxf", cache / f"gerber-{key}.json"
-        if not out.exists() or not meta.exists():
-            with contextlib.redirect_stdout(sys.stderr):
-                meta.write_text(json.dumps(gerber.convert(src, out)), encoding="utf-8")
-        return out
+        return self._gerber_dxf(src)[0]
 
     def clear_comparison(self) -> None:
         with self._lock:

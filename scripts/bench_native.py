@@ -79,6 +79,15 @@ def bench(s: Session, tmp: Path, large: bool) -> None:
         arc = s.describe(s.find_type("ARC_DIMENSION", None, None, 1))[0]
         row("Read an arc dimension's value", "ezdxf uncommon.dxf", "raw DXF tags only (no value)",
             f"arc length {arc['measurement']:.4f}")
+        cc = native(SAMPLES / "dxf/ezdxf_uncommon.dxf")
+        skipped = cc.call("inspect_drawing", {}).json().get("skipped", {})
+        cc.close()
+        report, _ = s.check()
+        lost = report.get("dropped_by_engine", [])
+        row("Say what the engine could not read", "ezdxf uncommon.dxf",
+            f"inspect_drawing: skipped {json.dumps(skipped)}",
+            "check: " + ", ".join(f"{r['type']} {r['handle']} ({r.get('kind', '')})" for r in lost)
+            + f"; not drawn: {report['not_drawn'][0]['reason'][:50]}...")
     if need("mech/DRYER_ASSEMBLY.dwg"):
         cc = native(SAMPLES / "mech/DRYER_ASSEMBLY.dwg")
         cc.execute("layout.set", {"name": "Layout2"})
