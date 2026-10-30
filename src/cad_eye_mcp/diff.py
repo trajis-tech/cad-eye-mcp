@@ -89,21 +89,21 @@ class Signer:
         that spells out default values compares equal to one that omits them."""
         t = e.dxftype()
         out: dict[str, Any] = {}
-        for k, v in e.dxf.all_existing_dxf_attribs().items():
-            if k in _SKIP or k.endswith("_handle"):
-                continue
-            if t == "INSERT" and k == "name":
-                continue  # replaced by the block's content below
-            if hasattr(v, "x") and hasattr(v, "y"):
-                v = _pt(v)
-            elif k == "dimtype":
-                v &= ~32  # "block used by this dimension only": set or not depending on the writer
-            if v == _default(e, k):
-                continue
-            out[k] = v
         try:
+            for k, v in e.dxf.all_existing_dxf_attribs().items():
+                if k in _SKIP or k.endswith("_handle"):
+                    continue
+                if t == "INSERT" and k == "name":
+                    continue  # replaced by the block's content below
+                if hasattr(v, "x") and hasattr(v, "y"):
+                    v = _pt(v)
+                elif k == "dimtype":
+                    v &= ~32  # "block used by this dimension only": set or not depending on the writer
+                if v == _default(e, k):
+                    continue
+                out[k] = v
             self._extra(e, t, out)
-        except Exception as ex:  # noqa: BLE001 - an entity ezdxf cannot fully decode
+        except Exception as ex:  # noqa: BLE001 - an entity ezdxf cannot fully decode: compare what was read
             out["undecodable"] = type(ex).__name__
         return out
 
@@ -312,20 +312,20 @@ def compare(new_doc: Drawing, old_doc: Drawing, tol: float) -> tuple[list[Change
     sn, so = Signer(new_doc, tol), Signer(old_doc, tol)
     new_items, old_items = items(new_doc, sn), items(old_doc, so)
 
-    # 1. identical content
-    pool: dict[tuple, list[Item]] = defaultdict(list)
+    # 1. identical content (among identical copies, the one with the same handle first)
+    pool: dict[tuple, dict[str, Item]] = defaultdict(dict)
     for it in old_items:
-        pool[(it.space, it.sig)].append(it)
+        pool[(it.space, it.sig)][it.handle] = it
     left_new, same_handle, unchanged = [], 0, 0
     for it in new_items:
         bucket = pool.get((it.space, it.sig))
         if bucket:
-            twin = bucket.pop()
+            twin = bucket.pop(it.handle, None) or bucket.pop(next(iter(bucket)))
             unchanged += 1
             same_handle += twin.handle == it.handle
         else:
             left_new.append(it)
-    left_old = [it for bucket in pool.values() for it in bucket]
+    left_old = [it for bucket in pool.values() for it in bucket.values()]
     pairs: list[tuple[Item, Item]] = []
 
     # 2. same handle: only when the files clearly share their numbering (same drawing, re-saved)

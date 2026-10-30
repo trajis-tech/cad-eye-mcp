@@ -11,7 +11,7 @@ import queue
 import subprocess
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from . import paths
 
@@ -45,6 +45,12 @@ class CadCraft:
         self._next_id = 0
         self._lock = threading.Lock()
         self._stderr_tail: list[str] = []
+        self.starts = 0
+        # called after the engine had to be restarted because it stopped or hung (not after
+        # close()), to bring the new process back to the state the caller expects
+        self.on_restart: Callable[[], None] | None = None
+        self._closed_on_purpose = True
+        self._restoring = False
 
     # -- process lifecycle -------------------------------------------------------------
     def _start(self) -> None:
@@ -67,6 +73,8 @@ class CadCraft:
             "clientInfo": {"name": "cad-eye-mcp", "version": "0"},
         })
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.starts += 1
+        self._closed_on_purpose = False
 
     def _alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -76,6 +84,10 @@ class CadCraft:
             self._start()
 
     def close(self) -> None:
+        self._closed_on_purpose = True
+        self._stop()
+
+    def _stop(self) -> None:
         proc, self._proc = self._proc, None
         if proc is None:
             return
@@ -123,7 +135,7 @@ class CadCraft:
         try:
             reply = q.get(timeout=self.timeout)
         except queue.Empty:
-            self.close()
+            self._stop()
             raise CadCraftError(f"CADCraft did not answer {method} within {self.timeout:.0f}s") from None
         finally:
             self._replies.pop(rid, None)
@@ -134,12 +146,21 @@ class CadCraft:
     # -- tools -------------------------------------------------------------------------
     def call(self, tool: str, args: dict | None = None) -> ToolResult:
         with self._lock:
+            lost = not self._alive() and self.starts > 0 and not self._closed_on_purpose
+            self.ensure_started()
+        if lost and self.on_restart is not None and not self._restoring:
+            self._restoring = True
+            try:
+                self.on_restart()
+            finally:
+                self._restoring = False
+        with self._lock:
             self.ensure_started()
             try:
                 result = self._request("tools/call", {"name": tool, "arguments": args or {}})
             except (BrokenPipeError, OSError) as e:
                 tail = "\n".join(self._stderr_tail[-5:])
-                self.close()
+                self._stop()
                 raise CadCraftError(f"CADCraft stopped: {e}\n{tail}") from e
         out = ToolResult()
         for block in result.get("content", []):

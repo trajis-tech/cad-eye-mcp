@@ -3,13 +3,14 @@
 import io
 import math
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 import ezdxf
 from PIL import Image
 
-from cad_eye_mcp import paths
+from cad_eye_mcp import deep, paths
 from cad_eye_mcp.session import FORBIDDEN_COMMANDS, Session, ViewerError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cjk_mixed.dxf"
@@ -83,6 +84,61 @@ class ViewerTest(unittest.TestCase):
         # the same commands without a file to write stay available
         self.assertIn("rows", self.s.command("dataextraction", {}))
 
+    def test_changes_to_the_drawing_are_undone(self):
+        self.s.zoom_extents()
+        text = self.s.pick((1500, 2550))[0][0]  # the Japanese text
+        count = self.s.cc.call("inspect_drawing", {}).json()["entityCount"]
+        for command, params in (("line", {"points": [[0, 0], [10, 10]]}), ("erase", {"handles": [text]}),
+                                ("move", {"handles": [text], "from": [0, 0], "to": [100, 0]})):
+            with self.assertRaises(ViewerError, msg=command):
+                self.s.command(command, params)
+        self.assertEqual(self.s.cc.call("inspect_drawing", {}).json()["entityCount"], count)
+        self.assertEqual(self.s.pick((1500, 2550))[0][0], text)  # still there, still where it was
+        self.assertAlmostEqual(self.s.command("dist", {"p1": [0, 0], "p2": [3, 4]})["distance"], 5)
+        self.s.command("draworder.back", {"handles": [text]})  # display only: allowed
+
+    def test_engine_restart_restores_the_drawing(self):
+        self.s.set_layers("hide", ["填充"])
+        try:
+            self.s.cc._proc.kill()  # the engine dies (or hangs and is stopped)
+            self.s.cc._proc.wait()
+            png, _ = self.s.frame()
+            info = self.s.cc.call("inspect_drawing", {}).json()
+            self.assertEqual(info["title"], FIXTURE.name)
+            self.assertFalse(next(l for l in info["layers"] if l["name"] == "填充")["on"])
+        finally:
+            self.s.set_layers("show_all", [])
+
+    def test_reading_the_previous_drawing_stops(self):
+        flag = self.s.drawing.dxf_cancel
+        self.s.open(str(SHEET))
+        self.s.open(str(FIXTURE))
+        self.assertTrue(flag.is_set())
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(deep.Cancelled):
+            deep.load(FIXTURE, stop)
+        self.assertEqual(len(deep.load(FIXTURE, threading.Event())[0].modelspace()),
+                         len(self.s.doc().modelspace()))
+
+    def test_one_drawing_in_the_engine(self):
+        self.s.open(str(SHEET))
+        self.s.open(str(FIXTURE))
+        # a further open is number 2: only the drawing on screen stayed open
+        self.assertEqual(self.s.cc.call("open", {"path": str(FIXTURE)}).json()["index"], 2)
+        self.s._restore_engine()
+
+    def test_failed_open_keeps_the_drawing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "broken.dwg"
+            bad.write_bytes(b"this is not a DWG file")
+            with self.assertRaises(Exception):
+                self.s.open(str(bad))
+        self.assertEqual(self.s.drawing.source, FIXTURE)
+        self.s.zoom_extents()
+        self.assertTrue(self.s.pick((1500, 2550)))
+        self.assertEqual(self.s.cc.call("inspect_drawing", {}).json()["title"], FIXTURE.name)
+
     def test_zoom_window_then_back(self):
         before = self.s.drawing.view
         self.s.zoom_window((0, 0), (1000, 1000))
@@ -122,6 +178,26 @@ class LayoutTest(unittest.TestCase):
     def test_unknown_layout(self):
         with self.assertRaises(ViewerError):
             self.s.set_layout("Layout9")
+
+    def test_select_by_handle_across_spaces(self):
+        doc = self.s.doc()
+        hole = next(e.dxf.handle for e in doc.modelspace().query("CIRCLE") if e.dxf.center.x == 90)
+        title = next(e.dxf.handle for e in doc.layouts.get("A3 圖紙").query("TEXT"))
+        self.s.set_layout("A3 圖紙")
+        try:
+            # a model-space hole on the sheet: framed where the 1:1 viewport shows it
+            self.assertEqual(self.s.not_on_screen([hole]), {})
+            (x0, y0), (x1, y1) = self.s.bbox_of([hole])
+            self.assertAlmostEqual(x0, 180, places=3)
+            self.assertAlmostEqual(x1, 200, places=3)
+            self.s.drawing.selection = [hole]
+            self.assertTrue(self.s.frame()[0].startswith(b"\x89PNG"))
+        finally:
+            self.s.set_layout("Model")
+        # the sheet's title seen from model space: not here, and the reason says where it is
+        self.assertIn("A3 圖紙", self.s.not_on_screen([title])[title])
+        with self.assertRaises(ViewerError):
+            self.s.zoom_to([title])
 
     def test_click_and_measure_through_viewport(self):
         self.s.set_layout("A3 圖紙")
@@ -234,7 +310,7 @@ class CheckTest(unittest.TestCase):
 
     def test_verdict_and_status_bar(self):
         self.assertTrue(self.report["verdict"].startswith("incomplete"))
-        self.assertIn("1 object not shown: run check", self.s._status()[1])
+        self.assertIn("! 1 xref missing: run check", self.s._status()[1])
 
     def test_missing_files(self):
         refs = self.report["references"]

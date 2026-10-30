@@ -48,7 +48,8 @@ def main() -> int:
                            "-r", str(ROOT / "requirements.txt")])
     import sysconfig
 
-    Path(sysconfig.get_paths()["purelib"], "cad_eye_mcp_src.pth").write_text(str(ROOT / "src") + "\n")
+    Path(sysconfig.get_paths()["purelib"], "cad_eye_mcp_src.pth").write_text(str(ROOT / "src") + "\n",
+                                                                               encoding="utf-8")
 
     cc = lock["cadcraft"]
     target = RUNTIME / "cadcraft" / cc["version"]

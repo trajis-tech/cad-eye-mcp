@@ -257,10 +257,15 @@ def select_window(
 def select(
     handles: Annotated[list[str], Field(description="Entity handles to select (replaces the selection)")],
 ) -> list:
-    """Select entities by handle and highlight them."""
+    """Select entities by handle and highlight them. On a sheet, model-space entities are
+    highlighted where a viewport shows them."""
     d = session.drawing
     d.selection = [h.upper() for h in handles]
-    return _screen({"selected": session.describe(d.selection[:40])})
+    extra: dict[str, Any] = {"selected": session.describe(d.selection[:40])}
+    elsewhere = session.not_on_screen(d.selection[:40])
+    if elsewhere:
+        extra["not_on_this_screen"] = elsewhere
+    return _screen(extra)
 
 
 @mcp.tool(annotations=VIEW_TOOL, structured_output=False)
@@ -523,6 +528,7 @@ def cad_command(
     params: Annotated[dict | None, Field(description="JSON parameters of the command")] = None,
 ) -> str:
     """Run a CADCraft command directly (its catalog has 400+ AutoCAD-style commands). Use for
-    inquiries the other tools do not cover. Changes stay in the viewer session and are never
-    saved; any command that writes or opens a file is refused."""
+    inquiries the other tools do not cover, and for display changes such as draw order. A
+    command that changes the drawing itself is undone and refused (cad-eye only reads), and
+    any command that writes or opens a file is refused."""
     return json.dumps(session.command(command, params), ensure_ascii=False, indent=1, default=str)

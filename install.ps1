@@ -62,9 +62,10 @@ Step 'Python packages'
 & $PyExe -I -m pip install --isolated --disable-pip-version-check --no-warn-script-location `
     --quiet -r (Join-Path $Root 'requirements.txt')
 if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
-# Make the package importable from source without installing a copy of it.
-$site = & $PyExe -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
-Set-Content -Path (Join-Path $site 'cad_eye_mcp_src.pth') -Value (Join-Path $Root 'src') -Encoding ASCII
+# Make the package importable from source without installing a copy of it. UTF-8 (Python reads
+# .pth files as UTF-8, BOM accepted), so a folder with Chinese or Japanese in its path works.
+$site = Join-Path $Runtime 'python\Lib\site-packages'   # python-build-standalone's layout on Windows
+Set-Content -Path (Join-Path $site 'cad_eye_mcp_src.pth') -Value (Join-Path $Root 'src') -Encoding UTF8
 
 # 3. CADCraft (headless CLI used as the view engine), one folder per version
 $CcDir = Join-Path $Runtime "cadcraft\$($lock.cadcraft.version)"

@@ -3,9 +3,11 @@ lengths and areas. CADCraft keeps the original DXF handles, so both engines shar
 
 from __future__ import annotations
 
+import io
 import math
 import mmap
 import re
+import threading
 import unicodedata
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,7 +18,9 @@ from ezdxf import bbox as ezbbox
 from ezdxf import path as ezpath
 from ezdxf.document import Drawing
 from ezdxf.entities import DXFGraphic
+from ezdxf.filemanagement import dxf_file_info
 from ezdxf.lldxf.encoding import decode_dxf_unicode
+from ezdxf.lldxf.validator import is_binary_dxf_file
 
 from .view import BBox, Point
 
@@ -29,10 +33,43 @@ TABLE = "ACAD_TABLE"  # ezdxf reads tables as tag storage, not as graphic entiti
 FLATTEN = 64  # segments per full circle when flattening curves for picking/highlighting
 
 
-def load(path: Path) -> tuple[Drawing, list[str]]:
-    """Read a DXF, falling back to ezdxf's recover mode for damaged files."""
+class Cancelled(Exception):
+    """Reading a DXF was given up (another drawing was opened meanwhile)."""
+
+
+class _Stoppable(io.RawIOBase):
+    """A file that gives up once `cancel` is set. The flag is looked at whenever the buffered
+    text stream on top asks for the next block (1 MB), so reading lines costs nothing extra."""
+
+    def __init__(self, path: Path, cancel: threading.Event) -> None:
+        self._raw, self._cancel = open(path, "rb", buffering=0), cancel
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        if self._cancel.is_set():
+            raise Cancelled
+        return self._raw.readinto(b)
+
+    def close(self) -> None:
+        self._raw.close()
+        super().close()
+
+
+def load(path: Path, cancel: threading.Event | None = None) -> tuple[Drawing, list[str]]:
+    """Read a DXF, falling back to ezdxf's recover mode for damaged files. Setting `cancel`
+    makes a read in progress give up (ASCII DXF, by far the common kind; binary DXF and
+    recovery read to the end)."""
     try:
-        return ezdxf.readfile(path), []
+        if cancel is None or is_binary_dxf_file(str(path)):
+            return ezdxf.readfile(path), []
+        info = dxf_file_info(str(path))  # the encoding, as ezdxf.readfile finds it
+        with io.TextIOWrapper(io.BufferedReader(_Stoppable(path, cancel), 1 << 20), encoding=info.encoding,
+                              errors="surrogateescape") as fp:
+            doc = ezdxf.read(fp)
+        doc.filename = str(path)
+        return doc, []
     except ezdxf.DXFStructureError:
         from ezdxf import recover
 
@@ -491,11 +528,9 @@ def table_rows(e) -> list[list[str]]:
     return rows
 
 
-def viewport_at(doc: Drawing, layout: str, p: Point):
-    """The viewport of a paper-space layout that shows model space at paper point `p` (the
-    smallest one if several overlap), or None. Only plan views (looking down the z axis) count:
-    they map paper to model coordinates by scale, rotation and offset."""
-    best, best_area = None, math.inf
+def plan_viewports(doc: Drawing, layout: str) -> Iterable[Any]:
+    """Viewports of a paper-space layout that show model space as a plan view (looking down the
+    z axis), which maps paper to model coordinates by scale, rotation and offset."""
     for vp in space(doc, layout).query("VIEWPORT"):
         dx = vp.dxf
         if dx.get("id", 0) == 1 or dx.get("status", 1) <= 0:
@@ -503,10 +538,26 @@ def viewport_at(doc: Drawing, layout: str, p: Point):
         direction = dx.get("view_direction_vector", (0, 0, 1))
         if abs(direction[0]) > 1e-9 or abs(direction[1]) > 1e-9 or direction[2] <= 0:
             continue
+        yield vp
+
+
+def viewport_at(doc: Drawing, layout: str, p: Point):
+    """The plan viewport that shows model space at paper point `p` (the smallest one if several
+    overlap), or None."""
+    best, best_area = None, math.inf
+    for vp in plan_viewports(doc, layout):
+        dx = vp.dxf
         w, h = dx.width, dx.height
         if abs(p[0] - dx.center.x) <= w / 2 and abs(p[1] - dx.center.y) <= h / 2 and w * h < best_area:
             best, best_area = vp, w * h
     return best
+
+
+def box_through(bb: BBox, m: np.ndarray) -> BBox:
+    """A model-space box as the paper-space box it covers through a viewport (matrix `m`)."""
+    corners = transform(np.asarray([bb[0], (bb[1][0], bb[0][1]), bb[1], (bb[0][0], bb[1][1])]), m)
+    (x0, y0), (x1, y1) = corners.min(axis=0), corners.max(axis=0)
+    return (float(x0), float(y0)), (float(x1), float(y1))
 
 
 def model_to_paper(vp) -> np.ndarray:

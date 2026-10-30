@@ -62,7 +62,7 @@ units), so the AI can point at what it sees.
 | `check` | Completeness and integrity report: what of the file is not on screen and why (entities that cannot be drawn, entities the engine could not read, missing xrefs and image files, hidden layers, other layouts, audit problems, unconverted Gerber data), with the problems marked on the drawing |
 | `mark` | Put labelled markers on the drawing to point out findings |
 | `screen_settings` | Screen size, grid, minimap, CJK glyph region |
-| `cad_command` | Run any of CADCraft's 400+ AutoCAD-style commands (commands that write files are refused) |
+| `cad_command` | Run CADCraft's 400+ AutoCAD-style commands for inquiries (list, dist, area, massprop...) and display changes (draw order); a command that changes the drawing is undone, one that writes a file is refused |
 
 Files are never modified.
 

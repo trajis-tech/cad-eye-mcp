@@ -39,6 +39,27 @@ FORBIDDEN_COMMANDS = ("save", "qsave", "saveas", "wblock", "export", "exportpdf"
 # commands that write a file only when given one of these parameters (with any value, or this value)
 WRITES_WITH = {"layout": ("option", "saveas"), "dataextraction": ("file", None), "eattext": ("file", None)}
 AUTOSAVE_VARS = ("SAVETIME", "SAVEFILEPATH")  # switched off on open, and kept off
+# engine commands that would take the engine away from the session's drawing, layout or view
+OWN_TOOLS = {"layout.set": "Switch layouts with the layout tool, so the view follows.",
+             "ctab": "Switch layouts with the layout tool, so the view follows.",
+             "document.switch": "The viewer shows one drawing; open another with open_drawing.",
+             "compare": "Use the compare tool: it shows the differences on screen and explains each one.",
+             "compare.next": "Use compare(region=n) to visit the regions of a comparison.",
+             "compare.previous": "Use compare(region=n) to visit the regions of a comparison.",
+             "compareclose": "Use compare(clear=true) to end a comparison."}
+# commands that change how the drawing looks on screen, not what it holds
+DISPLAY_ONLY = ("draworder", "hatchtoback", "texttofront", "layiso", "layuniso", "layoff", "layon", "layfrz",
+                "laythw", "layer.set", "view", "regen", "zoom", "pan")
+
+
+def _undo_steps(before: list, after: list) -> int | None:
+    """How many entries a command put in front of the undo history (newest first; a full
+    history drops its oldest), or None when the history changed some other way (e.g. undo)."""
+    for k in range(len(after) + 1):
+        rest = after[k:]
+        if rest == before[:len(rest)] and (len(rest) == len(before) or len(after) >= len(before)):
+            return k
+    return None
 
 
 class ViewerError(RuntimeError):
@@ -115,6 +136,7 @@ class Drawing:
     boxes: list[BBox] = field(default_factory=list)
     lines: list[list[Point]] = field(default_factory=list)
     dxf: Future | None = None
+    dxf_cancel: threading.Event = field(default_factory=threading.Event)  # stops reading the DXF
     gerber_summary: dict | None = None
     thumb: tuple[str, Any, View] | None = None
     text_index: dict[str, list[tuple]] = field(default_factory=dict)  # space -> text boxes
@@ -138,6 +160,14 @@ class Drawing:
     missing_xrefs: list[str] = field(default_factory=list)
 
 
+def _save_copy(cc: CadCraft, out: Path) -> None:
+    """Have the engine write its drawing into the cache under a temporary name first, so a
+    crash never leaves a half-written file that later opens would trust."""
+    part = out.with_name(f"{out.stem}.part{out.suffix}")
+    cc.call("save", {"path": str(part)})
+    os.replace(part, out)
+
+
 def _cache_key(path: Path) -> str:
     h = hashlib.sha1(str(path.resolve()).encode())
     items = sorted(path.rglob("*")) if path.is_dir() else [path]
@@ -159,6 +189,7 @@ class Session:
         self._lock = threading.RLock()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ezdxf")
         self._aliases: dict[str, str] | None = None  # command name or alias -> command id
+        self.cc.on_restart = self._restore_engine  # the engine stopped or hung: reopen the drawing
 
     # -- helpers ---------------------------------------------------------------------
     @property
@@ -201,133 +232,153 @@ class Session:
     # -- open ------------------------------------------------------------------------
     def open(self, path: str) -> Drawing:
         with self._lock:
-            src = Path(path).expanduser()
-            if not src.is_absolute():
-                src = Path.cwd() / src
-            if not src.exists():
-                raise ViewerError(f"File not found: {src}")
-            notes: list[str] = []
-            gsum = None
-            if src.suffix.lower() == ".dwg":
-                kind = "dwg"
-            elif src.suffix.lower() == ".dxf":
-                kind = "dxf"
-            elif gerber.looks_like_gerber(src):
-                kind = "gerber"
+            previous = self.d
+            try:
+                return self._open(path)
+            except Exception:
+                # the engine may hold part of the new file: give it back the drawing still on record
+                if self.d is previous and previous is not None:
+                    try:
+                        self._restore_engine()
+                    except Exception:  # noqa: BLE001
+                        self.d = None
+                raise
+
+    def _open(self, path: str) -> Drawing:
+        src = Path(path).expanduser()
+        if not src.is_absolute():
+            src = Path.cwd() / src
+        if not src.exists():
+            raise ViewerError(f"File not found: {src}")
+        notes: list[str] = []
+        gsum = None
+        if src.suffix.lower() == ".dwg":
+            kind = "dwg"
+        elif src.suffix.lower() == ".dxf":
+            kind = "dxf"
+        elif gerber.looks_like_gerber(src):
+            kind = "gerber"
+        else:
+            kind = "dxf"
+
+        cache = paths.cache_dir()
+        key = _cache_key(src)
+        if kind == "gerber":
+            work, gsum = self._gerber_dxf(src)
+            open_path = work
+        else:
+            open_path = src
+            work = src if kind == "dxf" else cache / f"dwg-{key}.dxf"
+            if kind == "dxf" and not deep.has_handles(src):
+                # each engine would number the entities its own way: ezdxf reads CADCraft's copy
+                work = cache / f"dxf-{key}.dxf"
+
+        opened = self._engine_open(open_path)
+        notes += opened.get("warnings", []) if isinstance(opened, dict) else []
+        # objects the engine could not read from the file at all (none of them is shown)
+        skipped = (self.cc.call("inspect_drawing", {}).json().get("skipped") or {}).get("count", 0)
+        if skipped:
+            notes.append(f"{skipped} objects in the file could not be read by the engine and are not shown; "
+                         "check() tells which, when the file is a DXF")
+        if work != open_path and kind != "gerber" and not work.exists():
+            _save_copy(self.cc, work)
+
+        psum = None
+        undrawn = self._undrawn_types() if kind != "gerber" else set()
+        if kind != "gerber" and (undrawn or proxy.needs_explode(work)):
+            stem = f"explode{proxy.VERSION}-{key}"
+            pwork, pmeta = cache / f"{stem}.dxf", cache / f"{stem}.json"
+            if not pwork.exists() or not pmeta.exists():
+                with contextlib.redirect_stdout(sys.stderr):
+                    psum = proxy.explode(work, pwork, undrawn)
+                pmeta.write_text(json.dumps(psum), encoding="utf-8")
             else:
-                kind = "dxf"
+                psum = json.loads(pmeta.read_text(encoding="utf-8"))
+            if psum["drawn"]:
+                work = open_path = pwork
+                self._engine_open(open_path)
+                kinds = ", ".join(f"{t} x{n}" for t, n in psum["drawn"].items())
+                how = ", ".join(sorted(psum["how"]))
+                notes.append(f"Drawn by stand-ins ({how}): {kinds}. CADCraft cannot draw these types; "
+                             "clicking a stand-in reports the original under drawn_for")
+            if psum["classes"]:
+                notes.append("Custom object classes: " + ", ".join(f"{c} x{n}" for c, n in psum["classes"].items()))
+            if psum["not_drawn"]:
+                notes.append("Not drawn (no geometry, proxy graphic or flat-faced ACIS data to show): "
+                             + ", ".join(f"{t} x{n}" for t, n in psum["not_drawn"].items())
+                             + ". check() lists each one with the reason")
+        missing_xrefs = self._relink_xrefs(src) if kind != "gerber" else []
+        if missing_xrefs:
+            notes.append("External references not found, so their content is not shown: "
+                         + "; ".join(missing_xrefs[:20]) + ". Put those files next to the drawing to see them.")
 
-            cache = paths.cache_dir()
-            key = _cache_key(src)
-            if kind == "gerber":
-                work, gsum = self._gerber_dxf(src)
-                open_path = work
-            else:
-                open_path = src
-                work = src if kind == "dxf" else cache / f"dwg-{key}.dxf"
-                if kind == "dxf" and not deep.has_handles(src):
-                    # each engine would number the entities its own way: ezdxf reads CADCraft's copy
-                    work = cache / f"dxf-{key}.dxf"
+        info = self.cc.call("inspect_drawing", {}).json()
+        counts = info.get("counts", {})
+        ext = info.get("extents")
+        extents: BBox = ((ext[0][0], ext[0][1]), (ext[1][0], ext[1][1])) if ext else ((0, 0), (100, 100))
+        units_code = (self.cc.execute("getvar", {"name": "INSUNITS"}) or {}).get("value", 0)
+        units = deep.UNIT_NAMES.get(units_code, "unitless")
+        title = src.name
 
-            opened = self._engine_open(open_path)
-            notes += opened.get("warnings", []) if isinstance(opened, dict) else []
-            # objects the engine could not read from the file at all (none of them is shown)
-            skipped = (self.cc.call("inspect_drawing", {}).json().get("skipped") or {}).get("count", 0)
-            if skipped:
-                notes.append(f"{skipped} objects in the file could not be read by the engine and are not shown; "
-                             "check() tells which, when the file is a DXF")
-            if work != open_path and kind != "gerber" and not work.exists():
-                self.cc.call("save", {"path": str(work)})
-
-            psum = None
-            undrawn = self._undrawn_types() if kind != "gerber" else set()
-            if kind != "gerber" and (undrawn or proxy.needs_explode(work)):
-                stem = f"explode{proxy.VERSION}-{key}"
-                pwork, pmeta = cache / f"{stem}.dxf", cache / f"{stem}.json"
-                if not pwork.exists() or not pmeta.exists():
-                    with contextlib.redirect_stdout(sys.stderr):
-                        psum = proxy.explode(work, pwork, undrawn)
-                    pmeta.write_text(json.dumps(psum), encoding="utf-8")
-                else:
-                    psum = json.loads(pmeta.read_text(encoding="utf-8"))
-                if psum["drawn"]:
-                    work = open_path = pwork
-                    self._engine_open(open_path)
-                    kinds = ", ".join(f"{t} x{n}" for t, n in psum["drawn"].items())
-                    how = ", ".join(sorted(psum["how"]))
-                    notes.append(f"Drawn by stand-ins ({how}): {kinds}. CADCraft cannot draw these types; "
-                                 "clicking a stand-in reports the original under drawn_for")
-                if psum["classes"]:
-                    notes.append("Custom object classes: " + ", ".join(f"{c} x{n}" for c, n in psum["classes"].items()))
-                if psum["not_drawn"]:
-                    notes.append("Not drawn (no geometry, proxy graphic or flat-faced ACIS data to show): "
-                                 + ", ".join(f"{t} x{n}" for t, n in psum["not_drawn"].items())
-                                 + ". check() lists each one with the reason")
-            missing_xrefs = self._relink_xrefs(src) if kind != "gerber" else []
-            if missing_xrefs:
-                notes.append("External references not found, so their content is not shown: "
-                             + "; ".join(missing_xrefs[:20]) + ". Put those files next to the drawing to see them.")
-
-            info = self.cc.call("inspect_drawing", {}).json()
-            counts = info.get("counts", {})
-            ext = info.get("extents")
-            extents: BBox = ((ext[0][0], ext[0][1]), (ext[1][0], ext[1][1])) if ext else ((0, 0), (100, 100))
-            units_code = (self.cc.execute("getvar", {"name": "INSUNITS"}) or {}).get("value", 0)
-            units = deep.UNIT_NAMES.get(units_code, "unitless")
-            title = src.name
-
-            d = Drawing(src, kind, work, open_path, title, units, counts, extents, info.get("layers", []),
-                        fit_view(extents, *self.size), notes=notes, gerber_summary=gsum,
-                        model_units=units, paper_units=self._layout_units() if kind != "gerber" else {},
-                        proxy_origin=psum["origin"] if psum and psum["origin"] else None)
-            d.engine_skipped, d.missing_xrefs = skipped, missing_xrefs
-            if psum:
-                d.unsupported = dict(psum["not_drawn"])
-                d.not_drawn = psum.get("skipped", [])
-                d.non_visual = psum.get("non_visual", {})
-                if psum["drawn"]:
-                    d.stand_in_summary = {"by_type": dict(psum["drawn"]), "how": dict(psum["how"])}
-                for new, (orig, _) in psum["origin"].items():
-                    d.stand_ins.setdefault(orig, []).append(new)
-            if work is not None:
-                d.dxf = self._pool.submit(self._load_dxf, work)
-            if self.d is not None and self.d.dxf is not None:
+        d = Drawing(src, kind, work, open_path, title, units, counts, extents, info.get("layers", []),
+                    fit_view(extents, *self.size), notes=notes, gerber_summary=gsum,
+                    model_units=units, paper_units=self._layout_units() if kind != "gerber" else {},
+                    proxy_origin=psum["origin"] if psum and psum["origin"] else None)
+        d.engine_skipped, d.missing_xrefs = skipped, missing_xrefs
+        if psum:
+            d.unsupported = dict(psum["not_drawn"])
+            d.not_drawn = psum.get("skipped", [])
+            d.non_visual = psum.get("non_visual", {})
+            if psum["drawn"]:
+                d.stand_in_summary = {"by_type": dict(psum["drawn"]), "how": dict(psum["how"])}
+            for new, (orig, _) in psum["origin"].items():
+                d.stand_ins.setdefault(orig, []).append(new)
+        if self.d is not None:  # the drawing before: stop reading it, the reader is needed now
+            self.d.dxf_cancel.set()
+            if self.d.dxf is not None:
                 self.d.dxf.cancel()
-            self.d = d
-            if not ext:
-                # nothing drawable in model space (e.g. 3D-only objects): show a sheet that has content
-                sheet = self._first_drawn_layout()
-                if sheet:
-                    notes.append(f"Model space has nothing to draw; showing layout '{sheet}'")
-                else:
-                    notes.append("Nothing in this drawing can be drawn" + (
-                        f" (model space holds: {', '.join(f'{k} x{n}' for k, n in counts.items())})" if counts else ""))
-            if d.layouts:
-                notes.append(f"Paper-space layouts: {', '.join(d.layouts)}. Switch with layout(name=...); "
-                             "title blocks, drawing views and notes often live there.")
-            if (d.layout == "Model" and any(k in counts for k in ("Xline", "Ray"))
-                    and info.get("entityCount", 0) <= 20000):
-                doc = self.doc()
-                if doc is not None:
-                    robust = deep.extents(doc.modelspace())
-                    if robust:
-                        d.extents = robust
-                        d.view = fit_view(robust, *self.size)
-                        notes.append("view fitted without infinite XLINE/RAY entities")
-            if self.cjk_auto and kind != "gerber":
-                found = self.cc.call("find_text", {"limit": 3000}).json() or {}
-                region = guess_cjk_region([t.get("text", "") for t in found.get("texts", [])])
-                if region and region != self.cjk:
-                    self._restart_engine(region)
-                    notes.append(f"CJK glyphs set to {region.upper()} from the drawing's text")
-            return d
+        if work is not None:
+            d.dxf = self._pool.submit(self._load_dxf, work, d.dxf_cancel)
+        self.d = d
+        if not ext:
+            # nothing drawable in model space (e.g. 3D-only objects): show a sheet that has content
+            sheet = self._first_drawn_layout()
+            if sheet:
+                notes.append(f"Model space has nothing to draw; showing layout '{sheet}'")
+            else:
+                notes.append("Nothing in this drawing can be drawn" + (
+                    f" (model space holds: {', '.join(f'{k} x{n}' for k, n in counts.items())})" if counts else ""))
+        if d.layouts:
+            notes.append(f"Paper-space layouts: {', '.join(d.layouts)}. Switch with layout(name=...); "
+                         "title blocks, drawing views and notes often live there.")
+        if (d.layout == "Model" and any(k in counts for k in ("Xline", "Ray"))
+                and info.get("entityCount", 0) <= 20000):
+            doc = self.doc()
+            if doc is not None:
+                robust = deep.extents(doc.modelspace())
+                if robust:
+                    d.extents = robust
+                    d.view = fit_view(robust, *self.size)
+                    notes.append("view fitted without infinite XLINE/RAY entities")
+        if self.cjk_auto and kind != "gerber":
+            found = self.cc.call("find_text", {"limit": 3000}).json() or {}
+            region = guess_cjk_region([t.get("text", "") for t in found.get("texts", [])])
+            if region and region != self.cjk:
+                self._restart_engine(region)
+                notes.append(f"CJK glyphs set to {region.upper()} from the drawing's text")
+        return d
 
     def _engine_open(self, path: Path) -> dict:
-        """Open a file in the engine with autosave off: changes made through cad_command must
-        never reach a file, not even an autosave copy."""
+        """Open a file in the engine as its only drawing, with autosave off (changes made through
+        cad_command must never reach a file, not even an autosave copy)."""
         opened = self.cc.call("open", {"path": str(path)}).json() or {}
+        opened = opened if isinstance(opened, dict) else {}
+        # the engine keeps every drawing it opened, numbered from 1 with the new one last:
+        # close the earlier ones, or memory grows with every drawing looked at
+        for _ in range(int(opened.get("index") or 1) - 1):
+            self.cc.execute("close", {"index": 1})
         self.cc.execute("setvar", {"name": "SAVETIME", "value": 0})
-        return opened if isinstance(opened, dict) else {}
+        return opened
 
     # -- CJK glyph region --------------------------------------------------------------
     @property
@@ -348,6 +399,12 @@ class Session:
         os.environ["CAD_EYE_CJK"] = region
         frame_fonts.clear()  # overlay labels follow the region too
         self.cc.close()
+        self._restore_engine()
+
+    def _restore_engine(self) -> None:
+        """Bring a fresh engine process to the state of the open drawing: the file, its xrefs,
+        the layout on screen and the layer visibility. Runs after a restart for another glyph
+        region, and when the engine stopped or hung and had to be started again."""
         d = self.d
         if d is None:
             return
@@ -355,9 +412,12 @@ class Session:
         self._relink_xrefs(d.source)
         if d.layout != "Model":
             self.cc.execute("layout.set", {"name": d.layout})
+        fresh = {l["name"]: l for l in self.cc.call("inspect_drawing", {}).json().get("layers", [])}
         for layer in d.layers:
-            self.cc.execute("layer.set", {"name": layer["name"], "on": layer.get("on", True),
-                                          "frozen": layer.get("frozen", False)})
+            on, frozen = layer.get("on", True), layer.get("frozen", False)
+            now = fresh.get(layer["name"], {})
+            if (now.get("on", True), now.get("frozen", False)) != (on, frozen):
+                self.cc.execute("layer.set", {"name": layer["name"], "on": on, "frozen": frozen})
         d.thumb = None
 
     # -- external references and layouts -------------------------------------------------
@@ -458,9 +518,9 @@ class Session:
         self.annotate()
 
     @staticmethod
-    def _load_dxf(path: Path):
+    def _load_dxf(path: Path, cancel: threading.Event):
         with contextlib.redirect_stdout(sys.stderr):
-            return deep.load(path)
+            return deep.load(path, cancel)
 
     # -- frames ----------------------------------------------------------------------
     def frame(self, extra: dict | None = None) -> tuple[bytes, str]:
@@ -476,13 +536,16 @@ class Session:
                 doc = self.doc(wait=120)
                 if doc is not None:
                     for h in d.selection[:MAX_HIGHLIGHT]:
+                        e = deep.entity_by_handle(doc, h)
+                        shown, vp = self._shown(doc, h, e) if e is not None else (False, None)
+                        if not shown:
+                            continue  # in another space: nothing to outline here
                         # an object and its stand-ins form one highlight (one ring if small)
                         shapes = []
                         for part in (d.stand_ins.get(h.upper()) or [h])[:MAX_HIGHLIGHT]:
-                            e = deep.entity_by_handle(doc, part)
-                            if e is not None:
-                                shapes += deep.polylines(e)
-                        vp = deep.entity_by_handle(doc, d.through[h]) if h in d.through else None
+                            pe = deep.entity_by_handle(doc, part)
+                            if pe is not None:
+                                shapes += deep.polylines(pe)
                         if vp is not None:  # a model-space entity seen through a viewport
                             m, box = deep.model_to_paper(vp), deep.viewport_box(vp)
                             shapes = [part for s in shapes for part in deep.clip(deep.transform(s, m), box)]
@@ -520,10 +583,15 @@ class Session:
                  f"{v.scale:.4g} {d.units}/px  |  zoom {zoom:.3g}x")
         sel = f"selected {len(d.selection)}" + (f" ({', '.join(d.selection[:4])}{'…' if len(d.selection) > 4 else ''})" if d.selection else "")
         line2 = f"layers {on}/{len(d.layers)} visible  |  {sel}  |  px coords = this image's pixels"
-        missing = sum(d.unsupported.values()) + d.engine_skipped + len(d.missing_xrefs)
-        if missing:
-            line2 = (f"layers {on}/{len(d.layers)} visible  |  {sel}  |  "
-                     f"! {missing} {'object' if missing == 1 else 'objects'} not shown: run check")
+        gaps = []
+        if d.unsupported:
+            gaps.append(f"{sum(d.unsupported.values())} not drawn")
+        if d.engine_skipped:
+            gaps.append(f"{d.engine_skipped} not read")
+        if d.missing_xrefs:
+            gaps.append(f"{len(d.missing_xrefs)} xref{'s' if len(d.missing_xrefs) > 1 else ''} missing")
+        if gaps:
+            line2 = f"layers {on}/{len(d.layers)} visible  |  {sel}  |  ! {', '.join(gaps)}: run check"
         if d.comparison is not None:
             n = Counter(ch.kind for ch in d.comparison.changes)
             line2 = (f"compare vs {d.comparison.baseline.name}: +{n['added']} added (green)  "
@@ -570,7 +638,9 @@ class Session:
         with self._lock:
             box = self.bbox_of(handles)
             if box is None:
-                raise ViewerError("None of those handles has visible geometry.")
+                why = self.not_on_screen(handles[:5])
+                raise ViewerError("Nothing to frame on this screen: " + ("; ".join(f"{h} is {r}" for h, r in why.items())
+                                                                         or "those entities have no visible geometry."))
             (x0, y0), (x1, y1) = box
             pad = max(x1 - x0, y1 - y0) * margin or self.drawing.view.scale * 40
             self._set_view(self.drawing.view.fit(((x0 - pad, y0 - pad), (x1 + pad, y1 + pad)), margin=0))
@@ -647,7 +717,8 @@ class Session:
             args["type"] = type_
         if layer:
             args["layer"] = layer
-        res = self.cc.call("query_entities", args).json() or {}
+        with self._lock:  # never while a pick looks through a viewport (it switches spaces)
+            res = self.cc.call("query_entities", args).json() or {}
         visible = self._visible_layers()
         return [e["handle"] for e in res.get("entities", []) if e.get("layer") in visible]
 
@@ -799,23 +870,83 @@ class Session:
         return out
 
     def bbox_of(self, handles: list[str]) -> BBox | None:
+        """Box around the entities (and their stand-ins) as the current screen shows them:
+        through a viewport for model-space entities on a sheet; entities of other spaces are
+        left out."""
         doc = self.doc()
+        if doc is None:
+            return None
         boxes = []
-        through = self.drawing.through
-        for h in self._with_stand_ins(handles[:2000]):
-            e = deep.entity_by_handle(doc, h) if doc is not None else None
-            bb = deep.entity_bbox(e) if e is not None else None
-            vp = deep.entity_by_handle(doc, through[h]) if bb and h in through else None
-            if vp is not None:  # picked through a viewport: frame it where the sheet shows it
-                corners = deep.transform(np.asarray([bb[0], (bb[1][0], bb[0][1]), bb[1], (bb[0][0], bb[1][1])]),
-                                         deep.model_to_paper(vp))
-                bb = (tuple(corners.min(axis=0)), tuple(corners.max(axis=0)))
-            if bb:
-                boxes.append(bb)
+        for h in handles[:2000]:
+            e = deep.entity_by_handle(doc, h)
+            shown, vp = self._shown(doc, h, e) if e is not None else (False, None)
+            if not shown:
+                continue
+            for part in self._with_stand_ins([h]):
+                pe = deep.entity_by_handle(doc, part)
+                bb = deep.entity_bbox(pe) if pe is not None else None
+                if bb:
+                    boxes.append(deep.box_through(bb, deep.model_to_paper(vp)) if vp is not None else bb)
         if not boxes:
             return None
         return ((min(b[0][0] for b in boxes), min(b[0][1] for b in boxes)),
                 (max(b[1][0] for b in boxes), max(b[1][1] for b in boxes)))
+
+    def _space_of(self, doc, e) -> str | None:
+        """'Model', a layout name, or None for an entity inside a block definition."""
+        keys = {doc.modelspace().layout_key: "Model"}
+        for name in self.drawing.layouts:
+            lay = doc.layouts.get(name)
+            if lay is not None:
+                keys[lay.layout_key] = name
+        return keys.get(e.dxf.get("owner"))
+
+    def _shown(self, doc, h: str, e) -> tuple[bool, Any]:
+        """Whether entity `e` is on the current screen, and the viewport it is seen through (None
+        when it lies in the space on screen). A model-space entity on a sheet is shown by the
+        first plan viewport that covers it and does not freeze its layer."""
+        d = self.drawing
+        space = self._space_of(doc, e)
+        if space == d.layout:
+            return True, None
+        if space != "Model" or d.layout == "Model":
+            return False, None
+        vp = deep.entity_by_handle(doc, d.through[h]) if h in d.through else None
+        if vp is None:
+            bb = deep.entity_bbox(e)
+            for cand in (deep.plan_viewports(doc, d.layout) if bb else ()):
+                if cand.is_frozen(e.dxf.layer):
+                    continue
+                (px0, py0), (px1, py1) = deep.box_through(bb, deep.model_to_paper(cand))
+                (vx0, vy0), (vx1, vy1) = deep.viewport_box(cand)
+                if px0 <= vx1 and px1 >= vx0 and py0 <= vy1 and py1 >= vy0:
+                    vp = cand
+                    break
+        if vp is None:
+            return False, None
+        d.through[h] = vp.dxf.handle
+        return True, vp
+
+    def not_on_screen(self, handles: list[str]) -> dict[str, str]:
+        """Why entities are not on the current screen: which space they are in."""
+        d = self.drawing
+        doc = self.doc()
+        out = {}
+        for h in handles:
+            e = deep.entity_by_handle(doc, h) if doc is not None else None
+            if e is None:
+                out[h] = "no such entity in the DXF data"
+                continue
+            if self._shown(doc, h, e)[0]:
+                continue
+            space = self._space_of(doc, e)
+            if space is None:
+                out[h] = "inside a block definition (shown through its block references)"
+            elif space == "Model" and d.layout != "Model":
+                out[h] = "in model space, and no viewport on this sheet shows it"
+            else:
+                out[h] = f"in {'model space' if space == 'Model' else repr(space)}: switch with layout(name=...)"
+        return out
 
     def describe(self, handles: list[str], full: bool = False) -> list[dict]:
         doc = self.doc()
@@ -1121,7 +1252,7 @@ class Session:
                 cc = CadCraft()  # a second engine, so the open drawing stays as it is
                 try:
                     cc.call("open", {"path": str(src)})
-                    cc.call("save", {"path": str(out)})
+                    _save_copy(cc, out)
                 finally:
                     cc.close()
             return out
@@ -1310,13 +1441,31 @@ class Session:
             raise ViewerError(f"'{command}' with {key} would write a file, which the viewer never does.")
         if cid == "setvar" and str(params.get("name", "")).upper() in AUTOSAVE_VARS:
             raise ViewerError("Autosave stays off: the viewer never writes files.")
-        if cid in ("layout.set", "ctab"):
-            raise ViewerError("Switch layouts with the layout tool, so the view follows.")
+        if cid in OWN_TOOLS:
+            raise ViewerError(OWN_TOOLS[cid])
         with self._lock:
-            result = self.cc.execute(command, params or {})
+            before = self.cc.call("inspect_drawing", {}).json() or {}
+            result = self.cc.execute(command, params)
+            after = self.cc.call("inspect_drawing", {}).json() or {}
+            added = _undo_steps(before.get("undo") or [], after.get("undo") or [])
+            changed = after.get("entityCount") != before.get("entityCount")
+            if (added != 0 or changed) and not cid.lstrip("-_.").startswith(DISPLAY_ONLY):
+                # the drawing itself changed: take it back, so what is drawn stays what the file
+                # holds (clicks, inspect, check and compare read the file)
+                if added and not changed:
+                    self.cc.execute("undo", {"count": added})
+                else:
+                    self._restore_engine()  # reload from the file: always clean
+                self._refresh_layers()
+                raise ViewerError(f"'{command}' changes the drawing, so it was undone: cad-eye only reads "
+                                  "drawings (editing is cad-hand's job). Use cad_command for inquiries such as "
+                                  "list, dist, area, id, massprop or count, and for display changes such as "
+                                  "draw order; the layers tool shows and hides layers.")
             self._refresh_layers()
             return result
 
     def close(self) -> None:
+        if self.d is not None:
+            self.d.dxf_cancel.set()
         self.cc.close()
         self._pool.shutdown(wait=False, cancel_futures=True)
