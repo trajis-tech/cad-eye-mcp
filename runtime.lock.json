@@ -1,0 +1,73 @@
+{
+  "_comment": "Pinned third-party downloads. install.ps1 / install.sh fetch these into ./runtime and verify every SHA-256.",
+  "python": {
+    "version": "3.12.15",
+    "source": "https://github.com/astral-sh/python-build-standalone (release 20261013)",
+    "assets": {
+      "windows-x64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "7a2aef48e5ee569e310b29b32681debbc5d888e92790d85331a47736c6b06aad"
+      },
+      "windows-arm64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "864342350eec45119bf295d7af7d60a36842e1c6d181cce760fcc6f60e5a072a"
+      },
+      "linux-x64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "178d3d83b6e8e99285a65d3fce9c16b87952cc5efdb4d1a0e3ff3be18ff0fc9c"
+      },
+      "linux-arm64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "9467a99bacc7d90b64b02de7fa9ecfc99b72905e64e74f7ff6b460ad95cfed5a"
+      },
+      "macos-x64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-x86_64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "d09998f85752b646873a8a6bc7eea442a0d251b1c8d2413aa8ea06ef131c3335"
+      },
+      "macos-arm64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.12.15%2B20261013-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "9866e11cf2ae9caa1e671383786f248859a52dd8bfb702fb4c0dc2c65f1d36de"
+      }
+    }
+  },
+  "cadcraft": {
+    "version": "0.14.0",
+    "source": "https://github.com/storytold/cadcraft (MIT OR Apache-2.0)",
+    "assets": {
+      "windows-x64": {
+        "url": "https://github.com/storytold/cadcraft/releases/download/v0.14.0/cadcraft-0.14.0-windows-x64-portable.zip",
+        "sha256": "f6f2b874358f3062dfbaf354b706be334c6a7a3eff49c38861c79c8a8efbea7c"
+      },
+      "windows-arm64": {
+        "url": "https://github.com/storytold/cadcraft/releases/download/v0.14.0/cadcraft-0.14.0-windows-arm64-portable.zip",
+        "sha256": "f2e97d1e42dc9ce521ec3ca9ed38e0a04ca730b07634ffb61e3e1ebca98821d2"
+      },
+      "linux-x64": {
+        "url": "https://github.com/storytold/cadcraft/releases/download/v0.14.0/cadcraft-0.14.0-linux-x86_64.tar.gz",
+        "sha256": "95067c849f82305648249299bb86e645b730275aa8c5f19965d81990f83aea9b"
+      },
+      "linux-arm64": {
+        "url": "https://github.com/storytold/cadcraft/releases/download/v0.14.0/cadcraft-0.14.0-linux-aarch64.tar.gz",
+        "sha256": "7b0d181105da6f14f13ef1098fabb7b9317c1e97a2e8c0a9075c4c743c42d63a"
+      },
+      "macos-x64": {
+        "url": "https://github.com/storytold/cadcraft/releases/download/v0.14.0/cadcraft-cli-0.14.0-macos-universal.zip",
+        "sha256": "d6f8687f8966fc28e17fedb85ca672bb96ecba0c5497781dd2e7b5319762c4a4"
+      },
+      "macos-arm64": {
+        "url": "https://github.com/storytold/cadcraft/releases/download/v0.14.0/cadcraft-cli-0.14.0-macos-universal.zip",
+        "sha256": "d6f8687f8966fc28e17fedb85ca672bb96ecba0c5497781dd2e7b5319762c4a4"
+      }
+    }
+  },
+  "fonts": {
+    "source": "https://github.com/notofonts/noto-cjk (tag Sans2.004, SIL Open Font License 1.1)",
+    "files": [
+      {
+        "name": "NotoSansCJK-Regular.ttc",
+        "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTC/NotoSansCJK-Regular.ttc",
+        "sha256": "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
+      }
+    ]
+  }
+}

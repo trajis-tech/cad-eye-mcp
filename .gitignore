@@ -1,0 +1,10 @@
+# private runtime from install.ps1 / install.sh
+/runtime/
+# third-party sample drawings from scripts/fetch_samples.py (own licenses, never committed)
+/samples/
+# things waiting for a person to delete them
+/Delete/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/

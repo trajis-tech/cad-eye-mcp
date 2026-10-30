@@ -1,0 +1,30 @@
+[project]
+name = "cad-eye-mcp"
+version = "0.1.0"
+description = "MCP server that lets an AI operate a CAD viewer: zoom, pan, click, layers and measure on DXF, DWG and Gerber files"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.3,<3",
+    "ezdxf>=1.4",
+    "gerbonara>=1.4",
+    "pillow>=10.0",
+    "numpy>=1.26",
+]
+keywords = ["mcp", "cad", "dxf", "dwg", "gerber", "pcb", "viewer", "ai"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+    "Topic :: Multimedia :: Graphics :: Viewers",
+]
+
+[project.scripts]
+cad-eye-mcp = "cad_eye_mcp.__main__:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

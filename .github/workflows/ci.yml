@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # macOS builds are pinned but not yet supported; report them without failing the run.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./install.ps1
+
+      - name: Install runtime (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: ./install.sh
+
+      - name: Tests (Windows)
+        if: runner.os == 'Windows'
+        run: runtime\python\python.exe -I -X utf8 -m unittest discover -s tests -v
+
+      - name: Tests (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: runtime/python/bin/python3 -I -X utf8 -m unittest discover -s tests -v

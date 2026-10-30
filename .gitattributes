@@ -1,0 +1,6 @@
+# Shell scripts must keep LF endings to run on Linux/macOS, whatever core.autocrlf says.
+*.sh            text eol=lf
+cad-eye-mcp     text eol=lf
+*.cmd           text eol=crlf
+# Test drawings are compared as written by ezdxf.
+*.dxf           -text

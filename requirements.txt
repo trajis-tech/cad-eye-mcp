@@ -1,0 +1,6 @@
+# Exact versions the installers put into the private runtime (tested together).
+mcp==2.3.0
+ezdxf==1.4.5
+gerbonara==1.6.3
+pillow==13.0.0
+numpy==2.5.4
